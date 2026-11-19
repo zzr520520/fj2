@@ -627,6 +627,9 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) BOOL isAccountMutedOrRestricted;
 @property (nonatomic, copy) NSString *restrictionReasonDesc;
 @property (nonatomic, assign) double violationCheckedAt;
+// v2.5：好友申请每日限额状态
+@property (nonatomic, assign) NSInteger friendRequestsToday;
+@property (nonatomic, copy) NSString *friendRequestDayKey;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
 // --- 1. 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
@@ -757,7 +760,8 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)nick groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType;
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)gname ban:(BOOL)ban;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
-// v2.4：群内@兜底/同群试验/自动加好友路径已全部移除（风控合规：非好友直接跳过，绝不破盾）
+// v2.5：群内@兜底/同群试验/图片破冰已移除；非好友唯一通道=标准好友申请（每日限额+节律）
+- (void)ac_addIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion;
 - (void)ac_refreshViolationRecordState:(void(^)(BOOL restricted, NSString *reason))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
@@ -4344,13 +4348,19 @@ if (item.sourceType != 2) {
 item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
 BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
-// v2.4 风控合规闸门：非好友且对方仅好友可聊（chatMeType=1）→ 直接标记跳过。
-// 严禁 V2TIMManager 强发、严禁自动好友申请、严禁群内@轰炸——
-// 抓包实证冷启动 2 分 40 秒内向 7 个陌生会话发消息直接触发 30 天禁言。
-if (!effectiveFriend && chatMeType == 1) {
+// v2.5 通道降级（合规化过滤）：非双向好友绝不走任何消息发送通道——
+// 服务端图谱风控按“网络出度+节点信任度”打分，自动化向冷节点插入会话必被标记；
+// 改走标准关系链好友申请（合规信令），文案放附言，配合每日限额与人机节律。
+if (!effectiveFriend) {
 item.chatMeType = 1;
-ACLog(@"[发送引擎] 跳过 %@：非好友且对方仅好友可聊（不试发/不加好友/不群@）", item.targetId);
-if (completion) completion(NO, @"跳过：非好友且对方仅好友可聊");
+NSString *wording = cleanText.length > 0 ? cleanText : nil;
+ACLog(@"[通道降级] %@ 非好友，消息通道禁用，改走标准好友申请（附言 %lu 字）", item.targetId, (unsigned long)cleanText.length);
+[self ac_addIMFriend:item.targetId wording:wording completion:^(BOOL ok, NSString *detail) {
+if (completion) dispatch_async(dispatch_get_main_queue(), ^{
+if (ok) completion(YES, [NSString stringWithFormat:@"(好友申请)%@", detail ?: @"已提交"]);
+else completion(NO, [NSString stringWithFormat:@"好友申请：%@", detail ?: @"失败"]);
+});
+}];
 return;
 }
 ACLog(@"[发送引擎] 放行 C2C (friend=%d relation=%ld chatMeType=%ld)", isFriend, (long)relation, (long)chatMeType);
@@ -4363,6 +4373,53 @@ doSendFlow();
 } @catch (NSException *e) {
 if (completion) completion(NO, @"发送异常");
 }
+}
+// v2.5：标准好友申请通道（合规信令）——非好友唯一可用通道，带每日限额
+#define kACFriendRequestDailyLimit 10
+- (void)ac_addIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok, NSString *detail))completion {
+if (userId.length == 0) { if (completion) completion(NO, @"目标为空"); return; }
+// 每日限额：单日新增陌生联系人控制在平台自然人均值以下，防止滑动窗口统计被打穿
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"yyyy-MM-dd";
+NSString *today = [df stringFromDate:[NSDate date]];
+if (![self.friendRequestDayKey isEqualToString:today]) {
+self.friendRequestDayKey = today;
+self.friendRequestsToday = 0;
+}
+if (self.friendRequestsToday >= kACFriendRequestDailyLimit) {
+ACLog(@"[好友申请] 今日已申请 %ld 人（上限 %d），暂停以贴近自然节律", (long)self.friendRequestsToday, kACFriendRequestDailyLimit);
+if (completion) completion(NO, [NSString stringWithFormat:@"今日申请已达上限(%d)，明日再试", kACFriendRequestDailyLimit]);
+return;
+}
+@try {
+Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
+if (v2MgrCls && reqCls) {
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
+if ([manager respondsToSelector:addFriendSel]) {
+id req = [[reqCls alloc] init];
+[req setValue:userId forKey:@"userID"];
+NSString *w = [ACSafeStr(wording) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (w.length == 0) w = @"你好，很高兴认识你~";
+if (w.length > 90) w = [w substringWithRange:[w rangeOfComposedCharacterSequenceAtIndex:89]];   // 按字形边界截断，避免切坏中文
+[req setValue:w forKey:@"addWording"];
+[req setValue:@(2) forKey:@"addType"];
+self.friendRequestsToday++;
+void (^succ)(id) = ^(id res) {
+ACLog(@"[好友申请] %@ 提交成功（今日第 %ld 位）", userId, (long)self.friendRequestsToday);
+if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, @"申请已提交，待对方通过"); });
+};
+void (^fail)(int, NSString *) = ^(int c, NSString *d) {
+ACLog(@"[好友申请] %@ 失败 code=%d desc=%@", userId, c, d ?: @"");
+if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, [NSString stringWithFormat:@"(%d)%@", c, d ?: @""]); });
+};
+((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
+return;
+}
+}
+} @catch (NSException *e) {}
+if (completion) completion(NO, @"IM好友接口不可用");
 }
 // v2.4：违规记录熔断——批量任务启动前查询处罚状态（/client/biz/v2/violation/record/page）。
 // 检测到未到期“限制发言”记录 → 置位 isAccountMutedOrRestricted，rawSendV2Message 直接拒发。
@@ -5789,11 +5846,11 @@ weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在群发 (%ld/%
 if (ok) okCount++;
 else { failCount++; lastFail = detail ?: @""; }
 idx++;
-// v2.4 限频对齐 ChatSendRateLimitProvider/服务端 behaviorLimit：30 秒最多 2 条，
-// 单条间隔 15~25 秒随机；连续 5 人强制休眠 90 秒
+// v2.5 人机节律升级：单次任务间隔 30~45 秒（≥30 秒），30 秒最多 2 条；
+// 连续 5 人强制休眠 90 秒，单日新增陌生联系人由好友申请每日限额兜底
 ACForwardHelperManager *batchMgr = [ACForwardHelperManager shared];
 batchMgr.batchSendStreakCount++;
-NSTimeInterval randDelay = 15.0 + arc4random_uniform(11);
+NSTimeInterval randDelay = 30.0 + arc4random_uniform(16);
 if (batchMgr.batchSendStreakCount % 5 == 0) {
 randDelay += 90.0;
 ACLog(@"🛡️ [限频对齐] 已连续发送 %ld 人，强制休眠 90 秒...", (long)batchMgr.batchSendStreakCount);
