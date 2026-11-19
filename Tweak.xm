@@ -366,6 +366,104 @@ ACMediaSlotAutoReply = 2, // 槽位2：💬自动回复专属媒体
 ACMediaSlotMoment    = 3  // 槽位3：📝发动态专属媒体
 };
 #pragma mark - 1. 数据模型（采用纯 NSDictionary 转换，支持每条规则/任务独立媒体）
+#pragma mark - v2.4 原生实时签名桥接（杜绝跨请求/跨消息重放）
+// 定位 SecurityManager / AppSecurityManager（类方法或 shared 单例），找到能响应签名选择器的目标
+static id ACGetNativeSecurityTarget(SEL sel) {
+NSArray *clsNames = @[
+@"SecurityManager", @"airchat.SecurityManager", @"AirChat.SecurityManager",
+@"AppSecurityManager", @"airchat.AppSecurityManager",
+@"_TtC7airchat15SecurityManager", @"_TtC7airchat18AppSecurityManager"
+];
+for (NSString *name in clsNames) {
+Class cls = NSClassFromString(name);
+if (!cls) continue;
+if ([cls respondsToSelector:sel]) return cls;
+for (NSString *sharedName in @[@"shared", @"sharedInstance", @"sharedManager", @"defaultManager"]) {
+SEL sSel = NSSelectorFromString(sharedName);
+if ([cls respondsToSelector:sSel]) {
+@try {
+id inst = ((id (*)(id, SEL))objc_msgSend)(cls, sSel);
+if (inst && [inst respondsToSelector:sel]) return inst;
+} @catch (NSException *e) {}
+}
+}
+}
+return nil;
+}
+// 实时生成单次 HTTP 请求专属的 X-Lts-Id（绝不缓存复用）
+static NSString *ACGenerateFreshXLtsId(NSString *userId) {
+if (userId.length < 5) return nil;
+SEL sel = NSSelectorFromString(@"generateXLtsIdWithUserId:timestamp:");
+id target = ACGetNativeSecurityTarget(sel);
+if (!target) return nil;
+long long nowMs = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+if (!sig) return nil;
+@try {
+NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+[inv setTarget:target];
+[inv setSelector:sel];
+[inv setArgument:&userId atIndex:2];
+// 兼容 timestamp 为 int64 / double / NSString / NSNumber
+const char *argType = [sig getArgumentTypeAtIndex:3];
+if (argType && (argType[0] == 'q' || argType[0] == 'Q')) {
+[inv setArgument:&nowMs atIndex:3];
+} else if (argType && argType[0] == 'd') {
+double nowSec = [[NSDate date] timeIntervalSince1970];
+[inv setArgument:&nowSec atIndex:3];
+} else {
+NSString *tsStr = [NSString stringWithFormat:@"%lld", nowMs];
+[inv setArgument:&tsStr atIndex:3];
+}
+[inv invoke];
+__unsafe_unretained NSString *res = nil;
+[inv getReturnValue:&res];
+if ([res isKindOfClass:[NSString class]] && res.length >= 100) {
+return res;
+}
+} @catch (NSException *e) {
+ACLog(@"[签名桥接] 动态生成 X-Lts-Id 异常: %@", e.reason);
+}
+return nil;
+}
+// 实时生成每条 IM 消息专属的 cloudCustomData（绑定当前毫秒时间戳，消除重放特征）
+static NSData *ACGenerateFreshCloudCustomData(NSString *userId) {
+if (userId.length < 5) return nil;
+SEL sel = NSSelectorFromString(@"generateMessageClientTypeV2WithUserId:timestamp:channel:");
+id target = ACGetNativeSecurityTarget(sel);
+if (!target) return nil;
+long long nowMs = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+NSString *channel = @"ios";
+NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+if (!sig) return nil;
+@try {
+NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+[inv setTarget:target];
+[inv setSelector:sel];
+[inv setArgument:&userId atIndex:2];
+const char *argType = [sig getArgumentTypeAtIndex:3];
+if (argType && (argType[0] == 'q' || argType[0] == 'Q')) {
+[inv setArgument:&nowMs atIndex:3];
+} else {
+NSString *tsStr = [NSString stringWithFormat:@"%lld", nowMs];
+[inv setArgument:&tsStr atIndex:3];
+}
+[inv setArgument:&channel atIndex:4];
+[inv invoke];
+__unsafe_unretained NSString *v2Str = nil;
+[inv getReturnValue:&v2Str];
+if ([v2Str isKindOfClass:[NSString class]] && v2Str.length > 20) {
+NSDictionary *ccd = @{
+@"client_type": @"iOS",
+@"client_typeV2": v2Str
+};
+return [NSJSONSerialization dataWithJSONObject:ccd options:0 error:nil];
+}
+} @catch (NSException *e) {
+ACLog(@"[签名桥接] 动态生成 client_typeV2 异常: %@", e.reason);
+}
+return nil;
+}
 @interface ACContactItem : NSObject
 @property (nonatomic, copy) NSString *targetId;
 @property (nonatomic, copy) NSString *name;
@@ -525,6 +623,10 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, copy) NSString *selfUserId;
 @property (nonatomic, copy) NSString *capturedClientTypeV2;
 @property (nonatomic, strong) NSData *capturedCloudCustomData;
+// v2.4：违规熔断状态（/client/biz/v2/violation/record/page 检测“限制发言”处罚）
+@property (nonatomic, assign) BOOL isAccountMutedOrRestricted;
+@property (nonatomic, copy) NSString *restrictionReasonDesc;
+@property (nonatomic, assign) double violationCheckedAt;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
 // --- 1. 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
@@ -655,13 +757,9 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)nick groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType;
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)gname ban:(BOOL)ban;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
-// v2.3 群内@兜底与好友申请路径的前向声明
-- (NSString *)ac_sharedGroupIdForUser:(ACContactItem *)item;
-- (void)ac_tryGroupContextC2C:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg groupId:(NSString *)gid completion:(void(^)(BOOL ok, NSString *detail))completion;
-- (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg completion:(void(^)(BOOL ok, NSString *detail))completion;
-- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok))completion;
-- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion;
+// v2.4：群内@兜底/同群试验/自动加好友路径已全部移除（风控合规：非好友直接跳过，绝不破盾）
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion;
+- (void)ac_refreshViolationRecordState:(void(^)(BOOL restricted, NSString *reason))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
 - (void)ac_handleIncomingMessage:(id)msg;
 - (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID;
@@ -876,6 +974,9 @@ instance.groupMemberMap = [NSMutableDictionary dictionary];
 instance.groupMap = [NSMutableDictionary dictionary];
 instance.groupBanStatusMap = [NSMutableDictionary dictionary];
 instance.recipientStateCache = [NSMutableDictionary dictionary];
+instance.isAccountMutedOrRestricted = NO;   // v2.4：启动即查违规处罚状态，受限立即熔断
+instance.restrictionReasonDesc = nil;
+[instance ac_refreshViolationRecordState:nil];
 instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
 instance.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
 instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
@@ -1071,12 +1172,7 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud setBool:self.welcomeMediaEnabled forKey:@"AC_Welcome_Media_Enabled"];
 [ud setBool:self.welcomeVoiceCallEnabled forKey:@"AC_Welcome_VoiceCall_Enabled"];
 [ud setObject:[self.welcomeGroupIds allObjects] forKey:@"AC_AutoWelcome_Groups"];
-if (self.capturedClientTypeV2) {
-[ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
-}
-if ([self.capturedCloudCustomData isKindOfClass:[NSData class]] && self.capturedCloudCustomData.length > 10) {
-[ud setObject:self.capturedCloudCustomData forKey:@"AC_Captured_CloudCustomData"];
-}
+// v2.4：签名绝不再落盘（旧键 AC_Captured_* 只增重放自爆特征，遗留数据不再读写）
 if (self.latestHTTPHeaders.count > 0) {
 NSMutableDictionary *safeHeaders = [NSMutableDictionary dictionary];
 NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", @"x-request-no", @"user-agent", @"accept-language", nil];
@@ -1138,14 +1234,7 @@ NSString *gs = ACSafeStr(g);
 if (gs.length > 0) [self.welcomeGroupIds addObject:gs];
 }
 }
-NSString *savedV2 = ACSafeStr([ud objectForKey:@"AC_Captured_ClientTypeV2"]);
-if (savedV2.length > 10) {
-self.capturedClientTypeV2 = savedV2;
-}
-id savedCCD = [ud objectForKey:@"AC_Captured_CloudCustomData"];
-if ([savedCCD isKindOfClass:[NSData class]] && [(NSData *)savedCCD length] > 10) {
-self.capturedCloudCustomData = savedCCD;
-}
+// v2.4：不再从磁盘加载历史签名（AC_Captured_* 已废弃——每条消息/请求实时调原生生成）
 self.autoCommentEnabled = [ud boolForKey:@"AC_AutoComment_Enabled"];
 NSString *savedComment = ACSafeStr([ud objectForKey:@"AC_AutoComment_Text"]);
 self.autoCommentText = savedComment.length > 0 ? savedComment : @"不错";
@@ -1337,11 +1426,9 @@ if (isSelf && [cData isKindOfClass:[NSData class]] && cData.length > 10) {
 NSDictionary *cDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:cData options:0 error:nil]);
 NSString *v2Str = ACSafeStr(cDict[@"client_typeV2"]);
 if (v2Str.length > 10) {
+// v2.4：仅内存留档用于诊断，绝不落盘、绝不跨消息复用（签名必须每条实时生成）
 self.capturedClientTypeV2 = v2Str;
 self.capturedCloudCustomData = cData;
-// 持久化，避免冷启动后无自助发送记录时丢失真实签名
-[[NSUserDefaults standardUserDefaults] setObject:v2Str forKey:@"AC_Captured_ClientTypeV2"];
-[[NSUserDefaults standardUserDefaults] setObject:cData forKey:@"AC_Captured_CloudCustomData"];
 }
 }
 NSString *groupID = ACSafeStr(ACSafeValue(msg, @"groupID"));
@@ -3877,37 +3964,51 @@ return [NSString stringWithFormat:@"%@%@%@", pre, mut, tail];
 #pragma mark - 4. 支持「四槽位独立图片 / 独立视频 / 文本」破盾发送引擎
 - (void)ac_applyCapturedHeadersToRequest:(NSMutableURLRequest *)req {
 if (!req) return;
+if (req.URL.host) [req setValue:req.URL.host forHTTPHeaderField:@"Host"];
 [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
-// 修复：重放抓包 Header 时不能带上一次的 Content-Length / Host / Connection / Accept-Encoding
+// v2.4：X-Lts-Id / X-Request-No 绝不从缓存复用——每次请求即时生成新鲜签名
 if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 [lk isEqualToString:@"connection"] || [lk isEqualToString:@"accept-encoding"] ||
 [lk isEqualToString:@"content-type"] || [lk isEqualToString:@"accept"] ||
-[lk isEqualToString:@"user-agent"]) return;
+[lk isEqualToString:@"user-agent"] ||
+[lk isEqualToString:@"x-lts-id"] || [lk isEqualToString:@"x-request-no"]) return;
 [req setValue:v forHTTPHeaderField:k];
 }];
-// 强制使用当前 URL 的 host 作为 Host 头，杜绝被污染的 Host 头把 POST 分流到对象存储返回 405
-if (req.URL.host) [req setValue:req.URL.host forHTTPHeaderField:@"Host"];
-// 真实 UA 优先（HAR 实证 airchat/1102 ...），避免写死旧版 1017 与 version 头冲突被网关淘汰
+// 1. 严格对齐 2.1.9 (1102) 版本常数
 NSString *realUA = ACHeaderValue(self.latestHTTPHeaders, @"User-Agent");
 if (realUA.length == 0 || ![realUA.lowercaseString containsString:@"airchat/"]) realUA = kACNativeUserAgent;
 [req setValue:realUA forHTTPHeaderField:@"User-Agent"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-// 签名对必须成对出现：X-Lts-Id + X-Request-No（HAR 实证漏任意一个服务端验签直接 code:500）
-NSString *acToken = ACHeaderValue(self.latestHTTPHeaders, @"token");
-NSString *acUid = ACHeaderValue(self.latestHTTPHeaders, @"x-userid") ?: self.selfUserId;
 NSString *acVer = ACHeaderValue(self.latestHTTPHeaders, @"version");
-NSString *acChannel = ACHeaderValue(self.latestHTTPHeaders, @"channel");
-NSString *acReqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
-NSString *acLtsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (acToken.length > 0) [req setValue:acToken forHTTPHeaderField:@"token"];
-if (acUid.length > 0) [req setValue:acUid forHTTPHeaderField:@"x-userid"];
-if (acVer.length > 0) [req setValue:acVer forHTTPHeaderField:@"version"];
-if (acChannel.length > 0) [req setValue:acChannel forHTTPHeaderField:@"channel"];
-if (acReqNo.length > 0) [req setValue:acReqNo forHTTPHeaderField:@"X-Request-No"];
-if (acLtsId.length > 0) [req setValue:acLtsId forHTTPHeaderField:@"X-Lts-Id"];
+[req setValue:(acVer.length > 0 ? acVer : @"2.1.9 (1102)") forHTTPHeaderField:@"version"];
+// 2. 注入当前真实身份凭证（优先原生会话副本）
+NSString *acToken = ACNativeAuthStore()[@"token"] ?: ACHeaderValue(self.latestHTTPHeaders, @"token");
+NSString *acUid = ACNativeAuthStore()[@"x-userid"] ?: (ACHeaderValue(self.latestHTTPHeaders, @"x-userid") ?: self.selfUserId);
+NSString *acCh = ACNativeAuthStore()[@"channel"] ?: (ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios");
+if (ACIsValidAuthToken(acToken)) [req setValue:acToken forHTTPHeaderField:@"token"];
+if (acUid.length > 5) [req setValue:acUid forHTTPHeaderField:@"x-userid"];
+if (acCh.length > 0) [req setValue:acCh forHTTPHeaderField:@"channel"];
+// 3. 每次请求即时生成全新 X-Request-No（15 位毫秒序列号），严禁跨请求复用
+uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+static uint64_t sReqSeq = 0;
+sReqSeq = (sReqSeq + 1) & 0x7F;
+NSString *freshReqNo = [NSString stringWithFormat:@"%015llu", (nowMs << 7) | sReqSeq];
+[req setValue:freshReqNo forHTTPHeaderField:@"X-Request-No"];
+// 4. 每次请求实时调用原生 generateXLtsIdWithUserId:timestamp: 生成当次专属 X-Lts-Id；
+//    原生生成失败才回退缓存值（避免直接 500，但日志会标记复用风险）
+NSString *freshLts = ACGenerateFreshXLtsId(acUid);
+if (freshLts.length >= 100) {
+[req setValue:freshLts forHTTPHeaderField:@"X-Lts-Id"];
+} else {
+NSString *cached = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (cached.length > 0) {
+[req setValue:cached forHTTPHeaderField:@"X-Lts-Id"];
+ACLog(@"[签名桥接] 原生 X-Lts-Id 生成失败，本次回退缓存签名（存在重放特征风险）");
+}
+}
 }
 // 动态解析当前可用的业务网关：嗅探域名需通过严格白名单；.cc 部分节点已被切给静态存储，强制走 .cn
 - (NSString *)ac_activeBusinessHost {
@@ -3928,227 +4029,8 @@ if ([m.targetId isEqualToString:item.targetId] && m.fromGroupId.length > 0) retu
 }
 return nil;
 }
-// 群内 @ 兜底：不触碰 C2C 关系链，只要双方仍在同一群即可送达
-- (void)ac_sendGroupFallbackToGroup:(NSString *)groupId
-target:(ACContactItem *)item
-text:(NSString *)text
-media:(id)mediaMsg
-completion:(void(^)(BOOL ok, NSString *detail))completion {
-if (groupId.length == 0) {
-if (completion) completion(NO, @"无共同群，无法走群内兜底");
-return;
-}
-ACContactItem *groupItem = [[ACContactItem alloc] init];
-groupItem.targetId = groupId;
-groupItem.sourceType = 2;
-groupItem.name = @"群聊兜底";
-groupItem.chatMeType = 0;
-void (^sendAtText)(void) = ^{
-NSString *body = text.length > 0 ? text : @"👋";
-id msg = nil;
-@try {
-Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
-SEL atSel = NSSelectorFromString(@"createTextAtMessage:atUserList:");
-SEL textSel = NSSelectorFromString(@"createTextMessage:");
-if (manager && [manager respondsToSelector:atSel]) {
-msg = ((id (*)(id, SEL, NSString *, NSArray *))objc_msgSend)(manager, atSel, body, @[item.targetId]);
-} else if (manager && [manager respondsToSelector:textSel]) {
-msg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, textSel, body);
-@try { [msg setValue:@[item.targetId] forKey:@"groupAtUserList"]; } @catch (NSException *e) {}
-}
-} @catch (NSException *e) {}
-if (!msg) {
-if (completion) completion(NO, @"群兜底消息构造失败");
-return;
-}
-[self rawSendV2Message:msg toItem:groupItem completion:^(BOOL ok, int code, NSString *desc) {
-if (completion) completion(ok, ok ? @"群内@提醒送达" : [NSString stringWithFormat:@"群内@失败(%d)", code]);
-}];
-};
-if (mediaMsg) {
-[self rawSendV2Message:mediaMsg toItem:groupItem completion:^(BOOL ok, int c, NSString *d) {
-sendAtText();
-}];
-} else {
-sendAtText();
-}
-}
-// 把文字渲染成图片：171312.har 中首次触达正是图片消息，可绕开文本类发前过滤
-- (NSString *)ac_renderTextToImagePath:(NSString *)text {
-NSString *clean = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-if (clean.length == 0) return nil;
-UIFont *font = [UIFont systemFontOfSize:30.0];
-NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
-ps.lineBreakMode = NSLineBreakByCharWrapping;
-NSDictionary *attrs = @{NSFontAttributeName: font,
-NSForegroundColorAttributeName: [UIColor blackColor],
-NSParagraphStyleAttributeName: ps};
-CGFloat maxW = 660.0;
-CGRect r = [clean boundingRectWithSize:CGSizeMake(maxW, CGFLOAT_MAX)
-options:NSStringDrawingUsesLineFragmentOrigin
-attributes:attrs
-context:nil];
-CGFloat h = MIN(MAX(ceil(r.size.height) + 80.0, 240.0), 2200.0);
-CGSize size = CGSizeMake(720.0, h);
-UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
-[[UIColor whiteColor] setFill];
-UIRectFill((CGRect){CGPointZero, size});
-[clean drawInRect:CGRectMake(30.0, 40.0, maxW, h - 80.0) withAttributes:attrs];
-UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
-UIGraphicsEndImageContext();
-if (!img) return nil;
-NSData *png = UIImagePNGRepresentation(img);
-if (!png) return nil;
-NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ac_icebreak_text.png"];
-if (![png writeToFile:path atomically:YES]) return nil;
-return path;
-}
-- (id)ac_buildIcebreakImageMessage:(NSString *)text {
-NSString *path = [self imagePathForSlot:ACMediaSlotBatchSend];
-if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-path = [self ac_renderTextToImagePath:text];
-}
-if (path.length == 0) return nil;
-Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
-SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
-if (!manager || ![manager respondsToSelector:createImgSel]) return nil;
-return ((id (*)(id, SEL, id))objc_msgSend)(manager, createImgSel, path);
-}
-// 实验通道：在 C2C 的 cloudCustomData 里补上同群来源，验证服务端回调是否按同群关系放行
-- (void)ac_tryGroupContextC2C:(ACContactItem *)item
-text:(NSString *)text
-media:(id)mediaMsg
-groupId:(NSString *)gid
-completion:(void(^)(BOOL ok, NSString *detail))completion {
-@try {
-NSMutableDictionary *j = nil;
-id parsed = [NSJSONSerialization JSONObjectWithData:self.capturedCloudCustomData options:NSJSONReadingMutableContainers error:nil];
-if ([parsed isKindOfClass:[NSMutableDictionary class]]) j = parsed;
-if (!j) {
-if (completion) completion(NO, @"无可用签名");
-return;
-}
-j[@"fromGroupId"] = gid;
-j[@"groupId"] = gid;
-j[@"source"] = @"group_temp";
-j[@"sourceType"] = @"GROUP_TEMP";
-j[@"isStranger"] = @YES;
-NSData *merged = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
-if (merged.length <= 10) {
-if (completion) completion(NO, @"同群包构造失败");
-return;
-}
-void (^doSend)(void) = ^{
-Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
-if (!manager) {
-if (completion) completion(NO, @"IM未初始化");
-return;
-}
-id msg = mediaMsg;
-if (!msg) {
-SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
-if (text.length == 0 || ![manager respondsToSelector:createTextSel]) {
-if (completion) completion(NO, @"内容为空");
-return;
-}
-msg = ((id (*)(id, SEL, id))objc_msgSend)(manager, createTextSel, text);
-}
-[msg setValue:merged forKey:@"cloudCustomData"];
-ACLog(@"[群上下文试验] 携带 fromGroupId=%@ keys=%@ 发送 C2C", gid, [j.allKeys componentsJoinedByString:@","]);
-[self rawSendV2Message:msg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
-if (ok) {
-item.chatMeType = 0;
-ACLog(@"[群上下文试验] 送达");
-if (completion) completion(YES, @"🎫同群上下文送达");
-return;
-}
-ACLog(@"[群上下文试验] 仍被拒 code=%d desc=%@", code, desc ?: @"");
-if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @""]);
-}];
-};
-// 先按官方群成员发起私聊的形态做一次业务层报备，再发 C2C（请求真实下发，不 mock）
-NSString *host = [self ac_activeBusinessHost];
-if (host.length > 0) {
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/chat/check", host]]];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 3.0;
-[self ac_applyCapturedHeadersToRequest:req];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"targetUserId": item.targetId, @"sourceType": @(1), @"groupId": gid} options:0 error:nil];
-ACLog(@"[群上下文试验] 预检 /client/biz/chat/check group=%@", gid);
-acInternalRequest = YES;
-NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
-[[session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-ACLog(@"[群上下文试验] 预检返回 status=%ld err=%@", (long)[(NSHTTPURLResponse *)r statusCode], e.localizedDescription ?: @"");
-dispatch_async(dispatch_get_main_queue(), doSend);
-}] resume];
-acInternalRequest = NO;
-return;
-}
-doSend();
-} @catch (NSException *e) {
-if (completion) completion(NO, @"同群试验异常");
-}
-}
-// C2C 被拒后的降级链：可用的共同群 @ > 好友申请（附言带文案，对方通过前不算送达）
-- (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item
-text:(NSString *)text
-media:(id)mediaMsg
-completion:(void(^)(BOOL ok, NSString *detail))completion {
-void (^toFriendRequest)(void) = ^{
-ACLog(@"[发送引擎] 转好友申请（附言携带文案）");
-[self autoAddIMFriend:item.targetId wording:text completion:^(BOOL ok) {
-if (!completion) return;
-if (ok) completion(YES, @"(好友申请)附言已携带文案，待对方通过");
-else completion(NO, @"(120001)好友申请发送失败");
-}];
-};
-void (^toGroupOrFriend)(void) = ^{
-NSString *gid = [self ac_sharedGroupIdForUser:item];
-BOOL banned = gid.length > 0 ? [self.groupBanStatusMap[gid] boolValue] : NO;
-if (gid.length == 0 || banned) {
-if (gid.length > 0) ACLog(@"[发送引擎] 共同群 %@ 已标记禁言，跳过群通道", gid);
-toFriendRequest();
-return;
-}
-ACLog(@"[发送引擎] 改走共同群 @ 兜底 (群:%@)", gid);
-[self ac_sendGroupFallbackToGroup:gid target:item text:text media:mediaMsg completion:^(BOOL ok, NSString *detail) {
-if (ok) {
-if (completion) completion(YES, detail);
-return;
-}
-ACLog(@"[发送引擎] 群内@失败(%@)，继续回落到好友申请", detail ?: @"");
-toFriendRequest();
-}];
-};
-BOOL alreadyImage = NO;
-@try {
-alreadyImage = ([ACSafeValue(mediaMsg, @"elemType") integerValue] == 3);
-} @catch (NSException *ignore) {}
-if (alreadyImage) {
-toGroupOrFriend();
-return;
-}
-id iceMsg = [self ac_buildIcebreakImageMessage:text];
-if (!iceMsg) {
-toGroupOrFriend();
-return;
-}
-ACLog(@"[发送引擎] 文本被拒，改用图片破冰重试");
-[self rawSendV2Message:iceMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
-if (ok2) {
-item.chatMeType = 0;
-ACLog(@"[发送引擎] 图片破冰送达");
-if (completion) completion(YES, @"🖼️图片破冰送达");
-return;
-}
-ACLog(@"[发送引擎] 图片破冰仍被拒 code=%d desc=%@", code2, desc2 ?: @"");
-toGroupOrFriend();
-}];
-}
+// v2.4：已删除群内@兜底、文字渲染图片破冰、同群上下文试验、C2C 降级链、自动加好友——
+// 抓包实证冷启动批量私聊陌生人 2 分 40 秒即触发 30 天禁言；非好友目标一律直接跳过，绝不破盾。
 // 阶段2：发送前预检目标真实关系（GET /client/biz/v2/userinfo/getUserInfo?id=），10 分钟缓存
 // 目的：好友=false 且 chatMeType=1 的目标直接走群@/好友申请，不再发注定被 IM 服务端拒绝的 C2C
 - (void)ac_probeRecipientState:(ACContactItem *)item completion:(void(^)(BOOL isFriend, NSInteger chatMeType))completion {
@@ -4272,39 +4154,20 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion(-1);
 }
-- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok))completion {
-@try {
-Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
-if (v2MgrCls && reqCls) {
-id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
-if ([manager respondsToSelector:addFriendSel]) {
-id req = [[reqCls alloc] init];
-[req setValue:userId forKey:@"userID"];
-NSString *cleanWording = [ACSafeStr(wording) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-if (cleanWording.length == 0) cleanWording = @"你好，认识一下~";
-if (cleanWording.length > 90) cleanWording = [cleanWording substringToIndex:90];
-[req setValue:cleanWording forKey:@"addWording"];
-[req setValue:@(2) forKey:@"addType"];
-void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES); }); };
-void (^fail)(int, NSString *) = ^(int c,  NSString *d) {
-ACLog(@"[好友申请] %@ 失败 code=%d desc=%@", userId, c, d ?: @"");
-if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
-};
-((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
+// v2.4：自动加 IM 好友逻辑已删除——严禁自动刷好友申请（冷启动连环申请直接命中服务端行为风控）
+- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
+// 0. 处罚期熔断保护：账号处于限制发言期，立即终止一切发送
+if (self.isAccountMutedOrRestricted) {
+if (completion) completion(NO, -403, self.restrictionReasonDesc ?: @"账号处于限制发言期，已终止发送");
 return;
 }
+// 1. 群全员禁言前置拦截（绝不向已禁言群强发消息）
+BOOL isGroup = (item.sourceType == 2);
+if (isGroup && [self.groupBanStatusMap[item.targetId] boolValue]) {
+ACLog(@"[发送拦截] 群 %@ 处于全员禁言(ban=true)，跳过发送", item.targetId);
+if (completion) completion(NO, -10017, @"群全员禁言，已安全跳过");
+return;
 }
-} @catch (NSException *e) {}
-if (completion) completion(NO);
-}
-- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
-[self autoAddIMFriend:userId wording:nil completion:^(BOOL ok) {
-if (completion) completion();
-}];
-}
-- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 if (!v2MgrCls || !v2Msg) {
@@ -4316,38 +4179,19 @@ if (!manager) {
 if (completion) completion(NO, -1, @"IM未初始化");
 return;
 }
-// cloudCustomData 为可选字段，任何异常都不能影响发送
+// 2. 注入实时生成的 cloudCustomData（每条消息绑定当前毫秒时间戳的 client_typeV2；
+//    严禁注入伪造 role:system_robot，严禁重放历史捕获的旧时间戳签名）
 @try {
-BOOL isGroupChat = (item.sourceType == 2);
-if (isGroupChat && self.robotModeEnabled) {
-// 防封雷区②：机器人伪装仅限群聊——C2C 私聊不存在官方机器人，注入 role:system_robot 必被 /immessage/check-chat-record 抽检判封
-NSDictionary *robotJson = @{
-@"isRobot": @(1),
-@"isGroupRobot": @YES,
-@"robotName": self.robotDisplayName.length > 0 ? self.robotDisplayName : @"群管机器人",
-@"role": @"system_robot",
-@"client_type": @"iOS"
-};
-NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 error:nil];
-if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
-} else if (!isGroupChat && self.capturedCloudCustomData.length > 10) {
-// C2C 必须携带本机真实云端签名（仅 isSelf 采集，已在升级1中隔离他人签名），与原生 C2CSessionStrategy 保持一致
-// 若调用方已显式写入 cloudCustomData（如带 fromGroupId 的同群试验包），不再覆盖
-id existingCCD = nil;
-@try { existingCCD = [v2Msg valueForKey:@"cloudCustomData"]; } @catch (NSException *e) {}
-if (![existingCCD isKindOfClass:[NSData class]] || [(NSData *)existingCCD length] <= 10) {
-[v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
-}
-}
+NSData *freshCCD = ACGenerateFreshCloudCustomData(self.selfUserId);
+if (freshCCD.length > 10) [v2Msg setValue:freshCCD forKey:@"cloudCustomData"];
 } @catch (NSException *ignore) {}
-BOOL isGroup = (item.sourceType == 2);
 NSString *receiver = isGroup ? nil : item.targetId;
 NSString *groupID = isGroup ? item.targetId : nil;
 void (^succBlock)(void) = ^{
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, 0, nil); });
 };
 void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
-ACLog(@"[发送引擎] raw发送失败 code=%d desc=%@ elem=%ld", code, desc ?: @"", (long)[ACSafeValue(v2Msg, @"elemType") integerValue]);
+ACLog(@"[发送引擎] 发送失败 code=%d desc=%@", code, desc ?: @"");
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, code, desc); });
 };
 NSInteger priority = 1;
@@ -4483,16 +4327,15 @@ if (completion) completion(YES, firstMedia ? (mType == 2 ? @"视频送达" : (mT
 }
 return;
 }
-// 群聊被禁言直接返回
+// 群聊失败（含禁言/其他服务端码）：如实回报，绝不重试轰炸
 if (item.sourceType == 2) {
 if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
 return;
 }
-// C2C 被 IM 服务端拒绝（120001/20003）：业务 HTTP 接口无法改写 IM 关系链，直接切换可达通道
+// v2.4：C2C 被 IM 服务端拒绝（120001/20003）——严禁自动加好友/群@/HTTP 破盾重试，直接标记跳过
 item.chatMeType = 1;
-ACLog(@"[发送引擎] C2C 失败 code=%d desc=%@ 媒体类型=%ld 文本长度=%lu", code, desc ?: @"", (long)mType, (unsigned long)cleanText.length);
-id fallbackMedia = buildMediaMsg();
-[self ac_fallbackAfterC2CRejected:item text:cleanText media:fallbackMedia completion:completion];
+ACLog(@"[发送引擎] C2C 被拒 code=%d desc=%@，已标记跳过（不重试/不加好友）", code, desc ?: @"");
+if (completion) completion(NO, [NSString stringWithFormat:@"跳过：非好友或对方仅好友可聊(%d)", code]);
 }];
 };
 // 阶段3：AirChat 业务层 + IM 关系链 + IM allowType 三重预检后决策
@@ -4501,30 +4344,17 @@ if (item.sourceType != 2) {
 item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
 BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
-[self ac_probeIMAllowType:item.targetId completion:^(NSInteger allowType) {
-// allowType 只决定“别人能否加我为好友”，不代表可以发起私聊；
-// 非好友且 chatMeType=1 时 C2C 必报 120001，直接走降级链，不再浪费一次发送
+// v2.4 风控合规闸门：非好友且对方仅好友可聊（chatMeType=1）→ 直接标记跳过。
+// 严禁 V2TIMManager 强发、严禁自动好友申请、严禁群内@轰炸——
+// 抓包实证冷启动 2 分 40 秒内向 7 个陌生会话发消息直接触发 30 天禁言。
 if (!effectiveFriend && chatMeType == 1) {
-NSString *gid = [self ac_sharedGroupIdForUser:item];
-if (gid.length > 0 && self.capturedCloudCustomData.length > 10) {
-ACLog(@"[发送引擎] 非好友且仅好友可聊，先试同群上下文 C2C (群:%@)", gid);
-[self ac_tryGroupContextC2C:item text:cleanText media:buildMediaMsg() groupId:gid completion:^(BOOL okG, NSString *detailG) {
-if (okG) {
-if (completion) completion(YES, detailG);
+item.chatMeType = 1;
+ACLog(@"[发送引擎] 跳过 %@：非好友且对方仅好友可聊（不试发/不加好友/不群@）", item.targetId);
+if (completion) completion(NO, @"跳过：非好友且对方仅好友可聊");
 return;
 }
-ACLog(@"[发送引擎] 同群上下文试验失败(%@)，进入降级链", detailG ?: @"");
-[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
-}];
-return;
-}
-ACLog(@"[发送引擎] 非好友且目标仅好友可聊(chatMeType=1, allowType=%ld)，跳过 C2C", (long)allowType);
-[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
-return;
-}
-ACLog(@"[发送引擎] 放行 C2C (friend=%d relation=%ld allowType=%ld chatMeType=%ld)", isFriend, (long)relation, (long)allowType, (long)chatMeType);
+ACLog(@"[发送引擎] 放行 C2C (friend=%d relation=%ld chatMeType=%ld)", isFriend, (long)relation, (long)chatMeType);
 doSendFlow();
-}];
 }];
 }];
 } else {
@@ -4532,6 +4362,62 @@ doSendFlow();
 }
 } @catch (NSException *e) {
 if (completion) completion(NO, @"发送异常");
+}
+}
+// v2.4：违规记录熔断——批量任务启动前查询处罚状态（/client/biz/v2/violation/record/page）。
+// 检测到未到期“限制发言”记录 → 置位 isAccountMutedOrRestricted，rawSendV2Message 直接拒发。
+- (void)ac_refreshViolationRecordState:(void(^)(BOOL restricted, NSString *reason))completion {
+double now = [[NSDate date] timeIntervalSince1970];
+if (now - self.violationCheckedAt < 300.0) {
+if (completion) completion(self.isAccountMutedOrRestricted, self.restrictionReasonDesc);
+return;
+}
+self.violationCheckedAt = now;
+@try {
+NSString *host = [self ac_activeBusinessHost];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/violation/record/page?current=1&size=5", host]]];
+req.HTTPMethod = @"GET";
+req.timeoutInterval = 8.0;
+[self ac_applyCapturedHeadersToRequest:req];
+NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
+[[session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+BOOL restricted = NO;
+NSString *reason = nil;
+@try {
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:d options:0 error:nil]);
+NSArray *records = ACSafeValue(ACSafeDict(json[@"data"]), @"records");
+if (![records isKindOfClass:[NSArray class]]) records = ACSafeValue(json, @"records");
+double nowTs = [[NSDate date] timeIntervalSince1970];
+for (NSDictionary *rec in records) {
+if (![rec isKindOfClass:[NSDictionary class]]) continue;
+NSString *act = ACSafeStr(rec[@"actionType"] ?: rec[@"action_type"] ?: rec[@"penaltyType"]);
+if (act.length == 0 || ![act containsString:@"限制发言"]) continue;
+double end = [ACSafeStr(rec[@"endTime"] ?: rec[@"expireTime"] ?: rec[@"banEndTime"] ?: rec[@"endTimeMs"]) doubleValue];
+if (end > 1e12) end = end / 1000.0;   // 毫秒时间戳归一化为秒
+NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+fmt.dateFormat = @"yyyy-MM-dd HH:mm";
+if (end <= 0) {
+restricted = YES;
+reason = [NSString stringWithFormat:@"%@（服务端未返回到期时间，按最坏情况熔断）", act];
+break;
+}
+if (end > nowTs) {
+restricted = YES;
+reason = [NSString stringWithFormat:@"%@，到期时间 %@", act, [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:end]]];
+break;
+}
+}
+} @catch (NSException *ignore) {}
+dispatch_async(dispatch_get_main_queue(), ^{
+self.isAccountMutedOrRestricted = restricted;
+self.restrictionReasonDesc = reason;
+if (restricted) ACLog(@"⛔ [违规熔断] 检测到处罚记录：%@，所有自动发送已停", reason ?: @"限制发言");
+if (completion) completion(restricted, reason);
+});
+}] resume];
+} @catch (NSException *ex) {
+ACLog(@"[违规熔断] 查询异常: %@", ex.reason);
+if (completion) completion(self.isAccountMutedOrRestricted, self.restrictionReasonDesc);
 }
 }
 @end
@@ -5903,20 +5789,30 @@ weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在群发 (%ld/%
 if (ok) okCount++;
 else { failCount++; lastFail = detail ?: @""; }
 idx++;
-// 防封雷区④：拟人化阶梯延时（6.5~12 秒）+ 每连续 8 人强制插入 28~42 秒冷却休息
+// v2.4 限频对齐 ChatSendRateLimitProvider/服务端 behaviorLimit：30 秒最多 2 条，
+// 单条间隔 15~25 秒随机；连续 5 人强制休眠 90 秒
 ACForwardHelperManager *batchMgr = [ACForwardHelperManager shared];
 batchMgr.batchSendStreakCount++;
-NSTimeInterval randDelay = 6.5 + (arc4random_uniform(55) / 10.0);
-if (batchMgr.batchSendStreakCount % 8 == 0) {
-randDelay += 28.0 + arc4random_uniform(15);
-ACLog(@"🛡️ [防封降权] 已连续发送 %ld 人，自动进入 %.0f 秒安全冷却休息...", (long)batchMgr.batchSendStreakCount, randDelay);
+NSTimeInterval randDelay = 15.0 + arc4random_uniform(11);
+if (batchMgr.batchSendStreakCount % 5 == 0) {
+randDelay += 90.0;
+ACLog(@"🛡️ [限频对齐] 已连续发送 %ld 人，强制休眠 90 秒...", (long)batchMgr.batchSendStreakCount);
 }
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 nextStep();
 });
 }];
 };
+// v2.4 违规熔断：批量启动前先查处罚记录，受限账号整体停发
+[[ACForwardHelperManager shared] ac_refreshViolationRecordState:^(BOOL restricted, NSString *reason) {
+if (restricted) {
+weakSelf.floatingSendBtn.enabled = YES;
+weakSelf.statusLabel.textColor = [UIColor systemRedColor];
+weakSelf.statusLabel.text = [NSString stringWithFormat:@"⛔ 已熔断：%@，自动群发已停止", reason ?: @"账号处于限制发言期"];
+return;
+}
 nextStep();
+}];
 }
 - (void)dismissSelf {
 [self dismissViewControllerAnimated:YES completion:nil];
@@ -6172,32 +6068,10 @@ if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
 }];
 }
 // 【已删除】拦截 /post/app/publish 请求体存 mediaList 的逻辑：插件发动态媒体一律走本地素材 COS 上传
-// 风控自检软着陆：客户端聊天记录自检永远返回“未违规”，避免批量打招呼被客户端上报风控中心
-// （保持请求照常走 %orig 并只包装响应，返回 nil 会让 Alamofire 的 task.resume() 崩溃）
-if ([urlStr containsString:@"/immessage/check-chat-record"] || [urlStr containsString:@"/biz/chat/check"]) {
-if (completionHandler) {
-void (^cleanHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-NSDictionary *okDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
-NSData *okData = [NSJSONSerialization dataWithJSONObject:okDict options:0 error:nil];
-completionHandler(okData, response, error);
-};
-return %orig(request, cleanHandler);
-}
-}
-// 【HAR 192037 [81] 实锤修复】validateToken 含子串 "validate" 曾被本拦截误杀——响应被篡改成 data:@YES，
-// 插件拿不到 data.userId、官方切号 VC 校验失败直接中断！必须精确排除 validateToken
-// 【HAR 205944 复盘】再加 !acInternalRequest 双保险：插件自发请求（validateToken 拿本人 UID 等）绝不被本拦截篡改
-if (!acInternalRequest && ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] ||
-([urlStr containsString:@"validate"] && ![urlStr containsString:@"validateToken"]))) {
-if (completionHandler) {
-void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
-NSData *newData = [NSJSONSerialization dataWithJSONObject:successDict options:0 error:nil];
-completionHandler(newData, response, error);
-};
-return %orig(request, wrappedHandler);
-}
-}
+// v2.4：已删除以下本地响应篡改（mock）——
+// 1) /immessage/check-chat-record、/biz/chat/check 自检“永远未违规”假响应；
+// 2) checkPhoneRegister / updateMyPhoneNumber / validate 的 data:@YES 假响应。
+// 服务端应答原样透传，客户端不再自曝“响应被改包”；插件对宿主流量只读不写。
 // 兼容新老两种信息流接口（老：batchQueryPostInfo；新：client/biz/v2 分页接口）
 if (([urlStr containsString:@"/post/app/batchQueryPostInfo"] || [urlStr containsString:@"/client/biz/v2/post/app/page"]) && completionHandler) {
 void (^origHandler)(NSData *, NSURLResponse *, NSError *) = [completionHandler copy];
@@ -7011,12 +6885,9 @@ NSDictionary *j = ACSafeDict([NSJSONSerialization JSONObjectWithData:d options:0
 NSString *v2 = ACSafeStr(j[@"client_typeV2"]);
 if (v2.length <= 10) return;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-mgr.capturedCloudCustomData = d;
+mgr.capturedCloudCustomData = d;   // v2.4：仅内存诊断，不再落盘、不再跨消息复用
 mgr.capturedClientTypeV2 = v2;
-NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setObject:d forKey:@"AC_Captured_CloudCustomData"];
-[ud setObject:v2 forKey:@"AC_Captured_ClientTypeV2"];
-ACLog(@"[原生发送捕获] 已同步真实签名 cloudCustomData=%luB v2=%lu chars", (unsigned long)d.length, (unsigned long)v2.length);
+ACLog(@"[原生发送捕获] 已留档真实签名（仅内存）cloudCustomData=%luB v2=%lu chars", (unsigned long)d.length, (unsigned long)v2.length);
 NSString *ccdJson = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
 if (ccdJson.length > 0) ACLog(@"[原生发送捕获] ccd=%@", ccdJson);
 } @catch (NSException *e) {}
