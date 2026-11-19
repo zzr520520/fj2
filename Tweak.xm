@@ -743,6 +743,12 @@ customVideoDuration:(int)vDur
 toItem:(ACContactItem *)item
 completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)restartMomentScheduler;
+// v2.5b 多账号无损隔离：按 userId 分目录/分键存储，切号热切换不丢任何本地记录
+- (NSString *)ac_currentAccountScopeId;
+- (NSString *)ac_udKey:(NSString *)baseKey;
+- (NSString *)ac_scopedDocDirectory;
+- (void)ac_migrateLegacyCacheIfNeededForCurrentAccount;
+- (void)ac_switchToUserId:(NSString *)newUid;
 - (void)onMomentTimerTick;
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
 - (BOOL)ac_tryNativeMomentPublish:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
@@ -983,6 +989,11 @@ instance.restrictionReasonDesc = nil;
 [instance ac_refreshViolationRecordState:nil];
 instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
 instance.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
+// v2.5b：冷启动恢复最后登录号（仅 UID），使本次启动按正确账号分区加载缓存与配置
+{
+NSString *lastUid = ACSafeStr([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Last_Login_Uid"]);
+if (lastUid.length >= 5) instance.selfUserId = lastUid;
+}
 instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
 instance.welcomeGroupIds = [NSMutableSet set];
 instance.greetedUserIds = [NSMutableSet set];
@@ -1015,23 +1026,65 @@ instance.manualTargetGroupId = @"";
 });
 return instance;
 }
-#pragma mark - 2.0 四槽位彻底隔离的永久媒体存储引擎
-- (NSString *)imagePathForSlot:(ACMediaSlot)slot {
+#pragma mark - 2.0b 多账号无损隔离存储工具（按 userId 独立分目录/分键，绝不覆盖/清除任何账号本地记录）
+- (NSString *)ac_currentAccountScopeId {
+NSString *uid = [ACSafeStr(self.selfUserId) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (uid.length < 5) return @"guest";
+NSCharacterSet *invalid = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+NSString *clean = [[uid componentsSeparatedByCharactersInSet:invalid] componentsJoinedByString:@""];
+return clean.length > 0 ? clean : @"guest";
+}
+- (NSString *)ac_udKey:(NSString *)baseKey {
+return [NSString stringWithFormat:@"AC_%@_%@", [self ac_currentAccountScopeId], baseKey];
+}
+- (NSString *)ac_scopedDocDirectory {
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Image.jpg", (long)slot]];
+NSString *accountDir = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Accounts/%@", [self ac_currentAccountScopeId]]];
+NSFileManager *fm = [NSFileManager defaultManager];
+if (![fm fileExistsAtPath:accountDir]) {
+[fm createDirectoryAtPath:accountDir withIntermediateDirectories:YES attributes:nil error:nil];
+}
+return accountDir;
+}
+// 首次升级无损迁移：老版本全局缓存/槽位媒体若存在且当前账号目录还没有，复制一份过去（原文件永不删除）
+- (void)ac_migrateLegacyCacheIfNeededForCurrentAccount {
+if (self.selfUserId.length < 5) return;
+NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+NSString *scopedDir = [self ac_scopedDocDirectory];
+NSFileManager *fm = [NSFileManager defaultManager];
+NSArray *types = @[@"friends", @"members", @"groups", @"autoreply_rules", @"moment_tasks"];
+for (NSString *t in types) {
+NSString *oldPath = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_SafeCache_%@.plist", t]];
+NSString *newPath = [scopedDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_SafeCache_%@.plist", t]];
+if ([fm fileExistsAtPath:oldPath] && ![fm fileExistsAtPath:newPath]) {
+[fm copyItemAtPath:oldPath toPath:newPath error:nil];
+}
+}
+NSArray *slotKinds = @[@[@"Image", @"jpg"], @[@"Video", @"mp4"], @[@"Thumb", @"jpg"], @[@"Audio", @"m4a"]];
+for (NSInteger slot = 0; slot <= 3; slot++) {
+for (NSArray *kind in slotKinds) {
+NSString *oldPath = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_%@.%@", (long)slot, kind[0], kind[1]]];
+NSString *newPath = [scopedDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_%@.%@", (long)slot, kind[0], kind[1]]];
+if ([fm fileExistsAtPath:oldPath] && ![fm fileExistsAtPath:newPath]) {
+[fm copyItemAtPath:oldPath toPath:newPath error:nil];
+}
+}
+}
+ACLog(@"[号隔离] 账号 %@ 存储目录就绪: %@", self.selfUserId, scopedDir);
+}
+#pragma mark - 2.0 四槽位彻底隔离的永久媒体存储引擎（v2.5b 起再按账号分目录）
+- (NSString *)imagePathForSlot:(ACMediaSlot)slot {
+return [[self ac_scopedDocDirectory] stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Image.jpg", (long)slot]];
 }
 - (NSString *)videoPathForSlot:(ACMediaSlot)slot {
-NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Video.mp4", (long)slot]];
+return [[self ac_scopedDocDirectory] stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Video.mp4", (long)slot]];
 }
 - (NSString *)videoThumbPathForSlot:(ACMediaSlot)slot {
-NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Thumb.jpg", (long)slot]];
+return [[self ac_scopedDocDirectory] stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Thumb.jpg", (long)slot]];
 }
 // 槽位语音条路径（0群发 / 1迎新 / 2自动回复 / 3发动态，彼此独立）
 - (NSString *)audioPathForSlot:(ACMediaSlot)slot {
-NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Audio.m4a", (long)slot]];
+return [[self ac_scopedDocDirectory] stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Audio.m4a", (long)slot]];
 }
 - (void)saveAudioAtURL:(NSURL *)audioURL forSlot:(ACMediaSlot)slot duration:(int)sec {
 if (!audioURL) return;
@@ -1045,8 +1098,8 @@ if (![audioURL.path isEqualToString:dest]) {
 int realDur = sec > 0 ? sec : [[ACAudioHelper shared] durationOfAudioAtPath:dest];
 if (realDur <= 0) realDur = 5;
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setInteger:3 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
-[ud setInteger:realDur forKey:[NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot]];
+[ud setInteger:3 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_MediaType", (long)slot]]];
+[ud setInteger:realDur forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_AudioDur", (long)slot]]];
 [ud synchronize];
 ACLog(@"[媒体槽位] 已保存【槽位%ld】语音条 (时长:%d秒)", (long)slot, realDur);
 } @catch (NSException *e) {
@@ -1054,12 +1107,12 @@ ACLog(@"[媒体槽位] 保存语音失败 %@", e.reason);
 }
 }
 - (int)audioDurationForSlot:(ACMediaSlot)slot {
-NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot];
+NSString *key = [self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_AudioDur", (long)slot]];
 int d = (int)[[NSUserDefaults standardUserDefaults] integerForKey:key];
 return d > 0 ? d : 5;
 }
 - (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot {
-NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot];
+NSString *key = [self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_MediaType", (long)slot]];
 NSInteger t = [[NSUserDefaults standardUserDefaults] integerForKey:key];
 NSFileManager *fm = [NSFileManager defaultManager];
 if (t == 1 && [fm fileExistsAtPath:[self imagePathForSlot:slot]]) return 1;
@@ -1068,7 +1121,7 @@ if (t == 3 && [fm fileExistsAtPath:[self audioPathForSlot:slot]]) return 3; // �
 return 0;
 }
 - (int)videoDurationForSlot:(ACMediaSlot)slot {
-NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot];
+NSString *key = [self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_VideoDur", (long)slot]];
 int d = (int)[[NSUserDefaults standardUserDefaults] integerForKey:key];
 return d > 0 ? d : 5;
 }
@@ -1090,8 +1143,8 @@ if (jpgData) {
 [jpgData writeToFile:[self imagePathForSlot:slot] atomically:YES];
 [[NSFileManager defaultManager] removeItemAtPath:[self videoPathForSlot:slot] error:nil];
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setInteger:1 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
-[ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot]];
+[ud setInteger:1 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_MediaType", (long)slot]]];
+[ud setInteger:0 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_VideoDur", (long)slot]]];
 [ud synchronize];
 }
 } @catch (NSException *e) {}
@@ -1135,8 +1188,8 @@ UIGraphicsEndImageContext();
 NSData *thumbData = UIImageJPEGRepresentation(thumbImg, 0.85);
 if (thumbData) [thumbData writeToFile:[self videoThumbPathForSlot:slot] atomically:YES];
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setInteger:2 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
-[ud setInteger:durationSec forKey:[NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot]];
+[ud setInteger:2 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_MediaType", (long)slot]]];
+[ud setInteger:durationSec forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_VideoDur", (long)slot]]];
 [ud synchronize];
 } @catch (NSException *e) {}
 }
@@ -1148,15 +1201,15 @@ NSFileManager *fm = [NSFileManager defaultManager];
 [fm removeItemAtPath:[self videoThumbPathForSlot:slot] error:nil];
 [fm removeItemAtPath:[self audioPathForSlot:slot] error:nil];
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
-[ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot]];
-[ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot]];
+[ud setInteger:0 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_MediaType", (long)slot]]];
+[ud setInteger:0 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_VideoDur", (long)slot]]];
+[ud setInteger:0 forKey:[self ac_udKey:[NSString stringWithFormat:@"Slot_%ld_AudioDur", (long)slot]]];
 [ud synchronize];
 } @catch (NSException *e) {}
 }
 - (NSString *)cacheFilePath:(NSString *)type {
-NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_SafeCache_%@.plist", type]];
+// v2.5b：按账号分目录存储（AC_Accounts/<scope>/AC_SafeCache_<type>.plist）
+return [[self ac_scopedDocDirectory] stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_SafeCache_%@.plist", type]];
 }
 - (void)clearAllGroupMembersCache {
 @synchronized (self) {
@@ -1169,48 +1222,38 @@ return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Sa
 - (void)saveAllCustomSettings {
 @try {
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setBool:self.autoWelcomeEnabled forKey:@"AC_AutoWelcome_Enabled"];
-[ud setObject:self.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~" forKey:@"AC_AutoWelcome_Text"];
+[ud setBool:self.autoWelcomeEnabled forKey:[self ac_udKey:@"AutoWelcome_Enabled"]];
+[ud setObject:self.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~" forKey:[self ac_udKey:@"AutoWelcome_Text"]];
 // 迎新三种方式独立开关（文字 / 图片视频 / 1 秒语音）
-[ud setBool:self.welcomeTextEnabled forKey:@"AC_Welcome_Text_Enabled"];
-[ud setBool:self.welcomeMediaEnabled forKey:@"AC_Welcome_Media_Enabled"];
-[ud setBool:self.welcomeVoiceCallEnabled forKey:@"AC_Welcome_VoiceCall_Enabled"];
-[ud setObject:[self.welcomeGroupIds allObjects] forKey:@"AC_AutoWelcome_Groups"];
-// v2.4：签名绝不再落盘（旧键 AC_Captured_* 只增重放自爆特征，遗留数据不再读写）
-if (self.latestHTTPHeaders.count > 0) {
-NSMutableDictionary *safeHeaders = [NSMutableDictionary dictionary];
-NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", @"x-request-no", @"user-agent", @"accept-language", nil];
-[self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
-if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
-NSString *lk = k.lowercaseString;
-if (![allowed containsObject:lk]) return;
-if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
-safeHeaders[lk] = v;
-}];
-[ud setObject:safeHeaders forKey:@"AC_Saved_HTTPHeaders"];
-}
+[ud setBool:self.welcomeTextEnabled forKey:[self ac_udKey:@"Welcome_Text_Enabled"]];
+[ud setBool:self.welcomeMediaEnabled forKey:[self ac_udKey:@"Welcome_Media_Enabled"]];
+[ud setBool:self.welcomeVoiceCallEnabled forKey:[self ac_udKey:@"Welcome_VoiceCall_Enabled"]];
+[ud setObject:[self.welcomeGroupIds allObjects] forKey:[self ac_udKey:@"AutoWelcome_Groups"]];
+// v2.5b：HTTP Headers / 签名绝不再落盘——切号后自动从宿主请求实时嗅探，防止 B 号带 A 号旧 Token 串号
 if (self.selfUserId.length > 5) {
-[ud setObject:self.selfUserId forKey:@"AC_Saved_SelfUserId"];
+[ud setObject:self.selfUserId forKey:[self ac_udKey:@"Saved_SelfUserId"]];
+// 全局记住最后登录号（冷启动用；仅 UID，不含任何凭证）
+[ud setObject:self.selfUserId forKey:@"AC_Last_Login_Uid"];
 }
-[ud setBool:self.autoReplyEnabled forKey:@"AC_AutoReply_Enabled"];
+[ud setBool:self.autoReplyEnabled forKey:[self ac_udKey:@"AutoReply_Enabled"]];
 NSMutableArray *rDicts = [NSMutableArray array];
 for (ACAutoReplyRule *r in self.autoReplyRules) {
 [rDicts addObject:(ACJSONSafeObject([r toDict], 0) ?: @{})];
 }
 [rDicts writeToFile:[self cacheFilePath:@"autoreply_rules"] atomically:YES];
-[ud setBool:self.autoMomentEnabled forKey:@"AC_AutoMoment_Enabled"];
-[ud setInteger:MAX(1, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
-[ud setBool:self.autoCommentEnabled forKey:@"AC_AutoComment_Enabled"];
-[ud setObject:(self.autoCommentText ?: @"不错") forKey:@"AC_AutoComment_Text"];
-[ud setBool:self.autoLikeEnabled forKey:@"AC_AutoLike_Enabled"];
-[ud setBool:self.keepAliveEnabled forKey:@"AC_KeepAlive_Enabled"];
-[ud setBool:self.robotModeEnabled forKey:@"AC_RobotMode_Enabled"];
-[ud setObject:(self.robotDisplayName ?: @"群管机器人") forKey:@"AC_Robot_Name"];
-[ud setFloat:self.voiceHangupSeconds forKey:@"AC_VoiceHangup_Seconds"];
-[ud setObject:(self.manualTargetGroupId ?: @"") forKey:@"AC_ManualTargetGroupId"];
+[ud setBool:self.autoMomentEnabled forKey:[self ac_udKey:@"AutoMoment_Enabled"]];
+[ud setInteger:MAX(1, self.momentIntervalMinutes) forKey:[self ac_udKey:@"AutoMoment_Interval"]];
+[ud setBool:self.autoCommentEnabled forKey:[self ac_udKey:@"AutoComment_Enabled"]];
+[ud setObject:(self.autoCommentText ?: @"不错") forKey:[self ac_udKey:@"AutoComment_Text"]];
+[ud setBool:self.autoLikeEnabled forKey:[self ac_udKey:@"AutoLike_Enabled"]];
+[ud setBool:self.keepAliveEnabled forKey:[self ac_udKey:@"KeepAlive_Enabled"]];
+[ud setBool:self.robotModeEnabled forKey:[self ac_udKey:@"RobotMode_Enabled"]];
+[ud setObject:(self.robotDisplayName ?: @"群管机器人") forKey:[self ac_udKey:@"Robot_Name"]];
+[ud setFloat:self.voiceHangupSeconds forKey:[self ac_udKey:@"VoiceHangup_Seconds"]];
+[ud setObject:(self.manualTargetGroupId ?: @"") forKey:[self ac_udKey:@"ManualTargetGroupId"]];
 NSArray *seenArr = [[self.autoCommentSeenIds allObjects] sortedArrayUsingSelector:@selector(compare:)];
 if (seenArr.count > 1500) seenArr = [seenArr subarrayWithRange:NSMakeRange(seenArr.count - 1500, 1500)];
-[ud setObject:seenArr forKey:@"AC_AutoComment_Seen"];
+[ud setObject:seenArr forKey:[self ac_udKey:@"AutoComment_Seen"]];
 NSMutableArray *mDicts = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
 [mDicts addObject:(ACJSONSafeObject([t toDict], 0) ?: @{})];
@@ -1222,16 +1265,16 @@ for (ACMomentTaskItem *t in self.momentTasks) {
 - (void)loadAllCustomSettings {
 @try {
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-self.autoWelcomeEnabled = [ud boolForKey:@"AC_AutoWelcome_Enabled"];
-NSString *savedText = ACSafeStr([ud objectForKey:@"AC_AutoWelcome_Text"]);
+self.autoWelcomeEnabled = [ud boolForKey:[self ac_udKey:@"AutoWelcome_Enabled"]];
+NSString *savedText = ACSafeStr([ud objectForKey:[self ac_udKey:@"AutoWelcome_Text"]]);
 self.welcomeMessageText = (savedText.length > 0) ? savedText : @"您好 {name}，欢迎进群！认识一下~";
 // 旧版本没有这三个键时默认「文字+图片」开启、语音关闭，保持原有行为
-id savedTextFlag = [ud objectForKey:@"AC_Welcome_Text_Enabled"];
-id savedMediaFlag = [ud objectForKey:@"AC_Welcome_Media_Enabled"];
-self.welcomeTextEnabled = savedTextFlag ? [ud boolForKey:@"AC_Welcome_Text_Enabled"] : YES;
-self.welcomeMediaEnabled = savedMediaFlag ? [ud boolForKey:@"AC_Welcome_Media_Enabled"] : YES;
-self.welcomeVoiceCallEnabled = [ud boolForKey:@"AC_Welcome_VoiceCall_Enabled"];
-NSArray *savedGroups = ACSafeArray([ud objectForKey:@"AC_AutoWelcome_Groups"]);
+id savedTextFlag = [ud objectForKey:[self ac_udKey:@"Welcome_Text_Enabled"]];
+id savedMediaFlag = [ud objectForKey:[self ac_udKey:@"Welcome_Media_Enabled"]];
+self.welcomeTextEnabled = savedTextFlag ? [ud boolForKey:[self ac_udKey:@"Welcome_Text_Enabled"]] : YES;
+self.welcomeMediaEnabled = savedMediaFlag ? [ud boolForKey:[self ac_udKey:@"Welcome_Media_Enabled"]] : YES;
+self.welcomeVoiceCallEnabled = [ud boolForKey:[self ac_udKey:@"Welcome_VoiceCall_Enabled"]];
+NSArray *savedGroups = ACSafeArray([ud objectForKey:[self ac_udKey:@"AutoWelcome_Groups"]]);
 if (savedGroups) {
 for (id g in savedGroups) {
 NSString *gs = ACSafeStr(g);
@@ -1239,56 +1282,30 @@ if (gs.length > 0) [self.welcomeGroupIds addObject:gs];
 }
 }
 // v2.4：不再从磁盘加载历史签名（AC_Captured_* 已废弃——每条消息/请求实时调原生生成）
-self.autoCommentEnabled = [ud boolForKey:@"AC_AutoComment_Enabled"];
-NSString *savedComment = ACSafeStr([ud objectForKey:@"AC_AutoComment_Text"]);
+self.autoCommentEnabled = [ud boolForKey:[self ac_udKey:@"AutoComment_Enabled"]];
+NSString *savedComment = ACSafeStr([ud objectForKey:[self ac_udKey:@"AutoComment_Text"]]);
 self.autoCommentText = savedComment.length > 0 ? savedComment : @"不错";
-self.autoLikeEnabled = [ud boolForKey:@"AC_AutoLike_Enabled"];
+self.autoLikeEnabled = [ud boolForKey:[self ac_udKey:@"AutoLike_Enabled"]];
 // 重启后开启自动点赞时，以当前时间作为“只赞新动态”的起点，避免把历史动态刷一遍
 if (self.autoLikeEnabled) self.autoLikeEnabledAt = [[NSDate date] timeIntervalSince1970];
-self.keepAliveEnabled = [ud boolForKey:@"AC_KeepAlive_Enabled"];
-self.robotModeEnabled = [ud boolForKey:@"AC_RobotMode_Enabled"];
-NSString *savedRobotName = ACSafeStr([ud objectForKey:@"AC_Robot_Name"]);
+self.keepAliveEnabled = [ud boolForKey:[self ac_udKey:@"KeepAlive_Enabled"]];
+self.robotModeEnabled = [ud boolForKey:[self ac_udKey:@"RobotMode_Enabled"]];
+NSString *savedRobotName = ACSafeStr([ud objectForKey:[self ac_udKey:@"Robot_Name"]]);
 self.robotDisplayName = savedRobotName.length > 0 ? savedRobotName : @"群管机器人";
-float savedHangup = [ud floatForKey:@"AC_VoiceHangup_Seconds"];
+float savedHangup = [ud floatForKey:[self ac_udKey:@"VoiceHangup_Seconds"]];
 self.voiceHangupSeconds = (savedHangup >= 0.3f && savedHangup <= 15.0f) ? savedHangup : 1.0f;
-self.manualTargetGroupId = ACSafeStr([ud objectForKey:@"AC_ManualTargetGroupId"]);
-NSArray *savedSeen = ACSafeArray([ud objectForKey:@"AC_AutoComment_Seen"]);
+self.manualTargetGroupId = ACSafeStr([ud objectForKey:[self ac_udKey:@"ManualTargetGroupId"]]);
+NSArray *savedSeen = ACSafeArray([ud objectForKey:[self ac_udKey:@"AutoComment_Seen"]]);
 if (savedSeen.count > 0) {
 for (id v in savedSeen) { NSString *sid = ACSafeStr(v); if (sid.length > 3) [self.autoCommentSeenIds addObject:sid]; }
 self.autoCommentSeeded = YES;
 }
-// 兼容旧版本：只恢复合法 Header，丢弃被 COS/上传请求污染的 UA 与短格式 X-Lts-Id
-NSDictionary *savedHeaders = ACSafeDict([ud objectForKey:@"AC_Saved_HTTPHeaders"]);
-if (savedHeaders) {
-NSMutableDictionary *clean = [NSMutableDictionary dictionary];
-[savedHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
-if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
-NSString *lk = k.lowercaseString;
-if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
-[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"] ||
-[lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
-[lk isEqualToString:@"user-agent"] ||
-[lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] || [lk isEqualToString:@"sign"] ||
-[lk isEqualToString:@"deviceid"] || [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"])) return;
-if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
-if ([lk isEqualToString:@"user-agent"] && ![[(NSString *)v lowercaseString] containsString:@"airchat/"]) return;
-clean[lk] = v;
-}];
-[self.latestHTTPHeaders addEntriesFromDictionary:clean];
-savedHeaders = clean;
-// 旧版本可能只存了原始大小写，统一补一份小写键
-for (NSString *k in savedHeaders) {
-if ([k isKindOfClass:[NSString class]]) {
-id v = savedHeaders[k];
-if ([v isKindOfClass:[NSString class]]) self.latestHTTPHeaders[k.lowercaseString] = v;
-}
-}
-}
-NSString *savedUid = ACSafeStr([ud objectForKey:@"AC_Saved_SelfUserId"]);
+// v2.5b：不再从磁盘加载历史 Headers（切号后实时嗅探）；AC_Saved_HTTPHeaders 旧键遗留数据直接无视
+NSString *savedUid = ACSafeStr([ud objectForKey:[self ac_udKey:@"Saved_SelfUserId"]]);
 if (savedUid.length > 5) {
 self.selfUserId = savedUid;
 }
-self.autoReplyEnabled = [ud boolForKey:@"AC_AutoReply_Enabled"];
+self.autoReplyEnabled = [ud boolForKey:[self ac_udKey:@"AutoReply_Enabled"]];
 NSArray *rArr = [NSArray arrayWithContentsOfFile:[self cacheFilePath:@"autoreply_rules"]];
 if ([rArr isKindOfClass:[NSArray class]] && rArr.count > 0) {
 for (NSDictionary *d in rArr) {
@@ -1305,8 +1322,8 @@ defRule.attachMedia = YES;
 defRule.enabled = YES;
 [self.autoReplyRules addObject:defRule];
 }
-self.autoMomentEnabled = [ud boolForKey:@"AC_AutoMoment_Enabled"];
-NSInteger savedInt = [ud integerForKey:@"AC_AutoMoment_Interval"];
+self.autoMomentEnabled = [ud boolForKey:[self ac_udKey:@"AutoMoment_Enabled"]];
+NSInteger savedInt = [ud integerForKey:[self ac_udKey:@"AutoMoment_Interval"]];
 self.momentIntervalMinutes = savedInt > 0 ? savedInt : 30;
 NSArray *mArr = [NSArray arrayWithContentsOfFile:[self cacheFilePath:@"moment_tasks"]];
 if ([mArr isKindOfClass:[NSArray class]] && mArr.count > 0) {
@@ -4421,6 +4438,75 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion(NO, @"IM好友接口不可用");
 }
+#pragma mark - 2.0b 切号上下文热切换（先落盘旧号 → 停旧队列 → 仅清内存 → 加载新号，绝不删任何本地记录）
+- (void)ac_switchToUserId:(NSString *)newUid {
+NSString *cleanNew = [ACSafeStr(newUid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (cleanNew.length < 5) return;
+@synchronized (self) {
+if ([ACSafeStr(self.selfUserId) isEqualToString:cleanNew]) return;
+ACLog(@"[号隔离] 切换账号上下文: %@ -> %@（保留双方全部本地文件）", self.selfUserId.length > 0 ? self.selfUserId : @"(未登录)", cleanNew);
+// 1. 先完整落盘保存旧号配置与通讯录缓存，绝不丢数据
+if (self.selfUserId.length >= 5) {
+[self saveAllCustomSettings];
+[self saveLocalPermanentCache];
+}
+// 2. 停止旧号正在运行的后台任务与定时器，防止跨号误发
+self.voiceCallRunning = NO;
+self.voiceMemoRunning = NO;
+self.momentPublishing = NO;
+self.autoCommentSending = NO;
+self.isLikeSending = NO;
+self.autoLikePolling = NO;
+if (self.momentTimer) { [self.momentTimer invalidate]; self.momentTimer = nil; }
+if (self.autoLikePollTimer) { [self.autoLikePollTimer invalidate]; self.autoLikePollTimer = nil; }
+// 3. 仅清空内存运行态凭证与列表（不动磁盘上的任何账号记录）
+[ACNativeAuthStore() removeAllObjects];
+[self.latestHTTPHeaders removeAllObjects];
+self.lastPublishHeaders = nil;
+self.capturedCloudCustomData = nil;
+self.capturedClientTypeV2 = nil;
+self.latestLtsAt = 0;
+self.latestCapturedMomentMediaList = nil;
+[self.friendList removeAllObjects];
+[self.friendMap removeAllObjects];
+[self.groupMemberList removeAllObjects];
+[self.groupMemberMap removeAllObjects];
+[self.groupList removeAllObjects];
+[self.groupMap removeAllObjects];
+[self.groupBanStatusMap removeAllObjects];
+[self.recipientStateCache removeAllObjects];
+[self.welcomeGroupIds removeAllObjects];
+[self.greetedUserIds removeAllObjects];
+[self.autoReplyRules removeAllObjects];
+[self.autoReplyCooldownMap removeAllObjects];
+[self.momentTasks removeAllObjects];
+[self.autoCommentSeenIds removeAllObjects];
+[self.autoCommentQueue removeAllObjects];
+[self.likedPostIds removeAllObjects];
+[self.likeQueue removeAllObjects];
+self.greetedCount = 0;
+self.autoRepliedCount = 0;
+self.autoCommentSeeded = NO;
+self.autoLikeSeeded = NO;
+self.currentMomentRotationIdx = 0;
+self.batchSendStreakCount = 0;
+self.friendRequestsToday = 0;
+self.friendRequestDayKey = nil;
+self.isAccountMutedOrRestricted = NO; // 新号是否受罚独立判定
+self.restrictionReasonDesc = nil;
+self.violationCheckedAt = 0;
+// 4. 切到新号：迁移旧版全局缓存 → 加载新号专属数据 → 重启调度器
+self.selfUserId = cleanNew;
+[self ac_migrateLegacyCacheIfNeededForCurrentAccount];
+[self loadLocalPermanentCache];
+[self loadAllCustomSettings];
+[self restartMomentScheduler];
+[self ac_startAutoLikePollTimer];
+dispatch_async(dispatch_get_main_queue(), ^{
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+});
+}
+}
 // v2.4：违规记录熔断——批量任务启动前查询处罚状态（/client/biz/v2/violation/record/page）。
 // 检测到未到期“限制发言”记录 → 置位 isAccountMutedOrRestricted，rawSendV2Message 直接拒发。
 - (void)ac_refreshViolationRecordState:(void(^)(BOOL restricted, NSString *reason))completion {
@@ -6070,8 +6156,9 @@ static NSURLRequest *ACSniffHostTraffic(NSURLRequest *request) {
         NSString *reqUid = ACHeaderValue(headers, @"x-userid");
         NSString *reqTok = ACHeaderValue(headers, @"token");
         if (reqUid.length > 5) {
+            // v2.5b 防串号：UID 变化即热切换账号分区（先落盘旧号再载新号），凭证随后重新嗅探
+            if (![ACSafeStr(mgr.selfUserId) isEqualToString:reqUid]) [mgr ac_switchToUserId:reqUid];
             ACNativeAuthStore()[@"x-userid"] = reqUid;
-            if (![ACSafeStr(mgr.selfUserId) isEqualToString:reqUid]) mgr.selfUserId = reqUid;
         }
         if (reqTok.length > 0) ACNativeAuthStore()[@"token"] = reqTok;
         if (ACIsValidAuthToken(reqTok)) mgr.latestHTTPHeaders[@"token"] = reqTok;
@@ -6121,7 +6208,11 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) {
+// v2.5b 防串号：UID 变化即热切换账号分区，凭证重新嗅探
+if (![ACSafeStr(mgr.selfUserId) isEqualToString:v]) [mgr ac_switchToUserId:v];
+ACNativeAuthStore()[@"x-userid"] = v;
+}
 }];
 }
 // 【已删除】拦截 /post/app/publish 请求体存 mediaList 的逻辑：插件发动态媒体一律走本地素材 COS 上传
@@ -6190,7 +6281,11 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) {
+// v2.5b 防串号：UID 变化即热切换账号分区，凭证重新嗅探
+if (![ACSafeStr(mgr.selfUserId) isEqualToString:v]) [mgr ac_switchToUserId:v];
+ACNativeAuthStore()[@"x-userid"] = v;
+}
 }];
 }
 }
@@ -6222,7 +6317,10 @@ if (stable || validLts) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
 [ACForwardHelperManager shared].latestHTTPHeaders[lowerField] = value;
 if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
-[ACForwardHelperManager shared].selfUserId = value;
+// v2.5b 防串号：UID 变化即热切换账号分区，凭证重新嗅探
+ACForwardHelperManager *swMgr = [ACForwardHelperManager shared];
+if (![ACSafeStr(swMgr.selfUserId) isEqualToString:value]) [swMgr ac_switchToUserId:value];
+ACNativeAuthStore()[@"x-userid"] = value;
 }
 }
 }
@@ -6272,7 +6370,11 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) {
+// v2.5b 防串号：UID 变化即热切换账号分区，凭证重新嗅探
+if (![ACSafeStr(mgr.selfUserId) isEqualToString:v]) [mgr ac_switchToUserId:v];
+ACNativeAuthStore()[@"x-userid"] = v;
+}
 }];
 }
 %end
@@ -6363,6 +6465,32 @@ static void ACEnableTableViewScrollingInView(UIView *view) {
     for (UIView *sub in view.subviews) ACEnableTableViewScrollingInView(sub);
 }
 
+// v2.5b：监听原生 IM 登录/登出，官方切号完成瞬间立刻隔离插件上下文（防跨号串发）
+%hook V2TIMManager
+- (void)login:(NSString *)userID userSig:(NSString *)userSig succ:(id)succ fail:(id)fail {
+if ([userID isKindOfClass:[NSString class]] && userID.length >= 5) {
+[[ACForwardHelperManager shared] ac_switchToUserId:userID];
+}
+%orig;
+}
+- (void)logout:(id)succ fail:(id)fail {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (mgr.selfUserId.length >= 5) {
+[mgr saveAllCustomSettings];
+[mgr saveLocalPermanentCache];
+}
+mgr.voiceCallRunning = NO;
+mgr.voiceMemoRunning = NO;
+mgr.momentPublishing = NO;
+if (mgr.momentTimer) { [mgr.momentTimer invalidate]; mgr.momentTimer = nil; }
+if (mgr.autoLikePollTimer) { [mgr.autoLikePollTimer invalidate]; mgr.autoLikePollTimer = nil; }
+[ACNativeAuthStore() removeAllObjects];
+[mgr.latestHTTPHeaders removeAllObjects];
+mgr.capturedCloudCustomData = nil;
+mgr.capturedClientTypeV2 = nil;
+%orig;
+}
+%end
 %hook NSUserDefaults
 - (NSArray<NSString *> *)stringArrayForKey:(NSString *)defaultName {
     if (g_bypassOfficialAccountLimit && [defaultName isEqualToString:@"associatedAccountUserIds"]) return @[];
