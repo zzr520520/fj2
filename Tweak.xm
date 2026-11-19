@@ -971,60 +971,73 @@ static CGSize ACVideoPixelSizeAtPath(NSString *path) {
 
 @implementation ACForwardHelperManager
 
+// v2.6 启动死锁根治：dispatch_once 内只做纯内存分配（不碰 NSUserDefaults/NSFileManager/网络，
+// 更不能触发任何被 Hook 的系统 API），重量级引导移到 once 外并加防重入闸。
+// 底层 Hook 可用 g_acDidBootstrap 判断插件是否已初始化完成，未完成直接透传，杜绝递归拉起。
+static ACForwardHelperManager *g_acSharedInstance = nil;
+static BOOL g_acDidBootstrap = NO;
+
 + (instancetype)shared {
-static ACForwardHelperManager *instance = nil;
 static dispatch_once_t onceToken;
 dispatch_once(&onceToken, ^{
-instance = [[ACForwardHelperManager alloc] init];
-instance.friendList = [NSMutableArray array];
-instance.groupMemberList = [NSMutableArray array];
-instance.groupList = [NSMutableArray array];
-instance.friendMap = [NSMutableDictionary dictionary];
-instance.groupMemberMap = [NSMutableDictionary dictionary];
-instance.groupMap = [NSMutableDictionary dictionary];
-instance.groupBanStatusMap = [NSMutableDictionary dictionary];
-instance.recipientStateCache = [NSMutableDictionary dictionary];
-instance.isAccountMutedOrRestricted = NO;   // v2.4：启动即查违规处罚状态，受限立即熔断
-instance.restrictionReasonDesc = nil;
-[instance ac_refreshViolationRecordState:nil];
-instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
-instance.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
+ACForwardHelperManager *inst = [[ACForwardHelperManager alloc] init];
+inst.friendList = [NSMutableArray array];
+inst.groupMemberList = [NSMutableArray array];
+inst.groupList = [NSMutableArray array];
+inst.friendMap = [NSMutableDictionary dictionary];
+inst.groupMemberMap = [NSMutableDictionary dictionary];
+inst.groupMap = [NSMutableDictionary dictionary];
+inst.groupBanStatusMap = [NSMutableDictionary dictionary];
+inst.recipientStateCache = [NSMutableDictionary dictionary];
+inst.latestHTTPHeaders = [NSMutableDictionary dictionary];
+inst.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
+inst.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
+inst.welcomeGroupIds = [NSMutableSet set];
+inst.greetedUserIds = [NSMutableSet set];
+inst.lastGreetLog = @"等待新人进群...";
+inst.welcomeTextEnabled = YES;
+inst.welcomeMediaEnabled = YES;
+inst.welcomeVoiceCallEnabled = NO;
+inst.autoReplyRules = [NSMutableArray array];
+inst.autoReplyCooldownMap = [NSMutableDictionary dictionary];
+inst.lastAutoReplyLog = @"等待别人发来私信...";
+inst.momentTasks = [NSMutableArray array];
+inst.momentIntervalMinutes = 30;
+inst.lastMomentLog = @"等待定时发布动态...";
+inst.autoCommentEnabled = NO;
+inst.autoCommentText = @"不错";
+inst.autoCommentSeenIds = [NSMutableSet set];
+inst.autoCommentQueue = [NSMutableArray array];
+inst.autoCommentSeeded = NO;
+inst.likedPostIds = [NSMutableSet set];
+inst.likeQueue = [NSMutableArray array];
+inst.robotDisplayName = @"群管机器人";
+inst.voiceHangupSeconds = 1.0f;
+inst.manualTargetGroupId = @"";
+g_acSharedInstance = inst;
+}); // ⬅️ dispatch_once 到此立刻结束并释放锁；期间任何 Hook 回调 +shared 都不会再死锁
+
+// 重量级引导放 once 外：UserDefaults/plist/网络/定时器全部在这里做，配合防重入标志
+if (!g_acDidBootstrap) {
+static BOOL sBootstrapping = NO;
+if (!sBootstrapping) {
+sBootstrapping = YES;
 // v2.5b：冷启动恢复最后登录号（仅 UID），使本次启动按正确账号分区加载缓存与配置
-{
 NSString *lastUid = ACSafeStr([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Last_Login_Uid"]);
-if (lastUid.length >= 5) instance.selfUserId = lastUid;
+if (lastUid.length >= 5) g_acSharedInstance.selfUserId = lastUid;
+[g_acSharedInstance loadLocalPermanentCache];
+[g_acSharedInstance loadAllCustomSettings];
+[g_acSharedInstance restartMomentScheduler];
+[g_acSharedInstance ac_applyKeepAliveState];
+[g_acSharedInstance ac_startAutoLikePollTimer];
+[g_acSharedInstance ac_startImmortalBackgroundEngine]; // 15 秒 GCD 不死心跳：守护保活播放器/定时动态时间戳补发/后台点赞
+g_acDidBootstrap = YES; // 先亮灯：此后 Hook 内调用 +shared 均安全直达
+sBootstrapping = NO;
+// v2.4：启动即查违规处罚状态（发 HTTP 请求 → 会走 NSURLSession Hook，必须在引导完成之后）
+[g_acSharedInstance ac_refreshViolationRecordState:nil];
 }
-instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
-instance.welcomeGroupIds = [NSMutableSet set];
-instance.greetedUserIds = [NSMutableSet set];
-instance.lastGreetLog = @"等待新人进群...";
-instance.welcomeTextEnabled = YES;
-instance.welcomeMediaEnabled = YES;
-instance.welcomeVoiceCallEnabled = NO;
-instance.autoReplyRules = [NSMutableArray array];
-instance.autoReplyCooldownMap = [NSMutableDictionary dictionary];
-instance.lastAutoReplyLog = @"等待别人发来私信...";
-instance.momentTasks = [NSMutableArray array];
-instance.momentIntervalMinutes = 30;
-instance.lastMomentLog = @"等待定时发布动态...";
-instance.autoCommentEnabled = NO;
-instance.autoCommentText = @"不错";
-instance.autoCommentSeenIds = [NSMutableSet set];
-instance.autoCommentQueue = [NSMutableArray array];
-instance.autoCommentSeeded = NO;
-instance.likedPostIds = [NSMutableSet set];
-instance.likeQueue = [NSMutableArray array];
-instance.robotDisplayName = @"群管机器人";
-instance.voiceHangupSeconds = 1.0f;
-instance.manualTargetGroupId = @"";
-[instance loadLocalPermanentCache];
-[instance loadAllCustomSettings];
-[instance restartMomentScheduler];
-[instance ac_applyKeepAliveState];
-[instance ac_startAutoLikePollTimer];
-[instance ac_startImmortalBackgroundEngine]; // 15 秒 GCD 不死心跳：守护保活播放器/定时动态时间戳补发/后台点赞
-});
-return instance;
+}
+return g_acSharedInstance;
 }
 #pragma mark - 2.0b 多账号无损隔离存储工具（按 userId 独立分目录/分键，绝不覆盖/清除任何账号本地记录）
 - (NSString *)ac_currentAccountScopeId {
@@ -6492,15 +6505,20 @@ mgr.capturedClientTypeV2 = nil;
 }
 %end
 %hook NSUserDefaults
+// v2.6 重入保护：插件引导未完成（g_acDidBootstrap==NO）时一律直接透传 %orig，
+// 绝不在 +shared 引导期间执行任何插件逻辑，防止 dispatch_once 递归死锁闪退
 - (NSArray<NSString *> *)stringArrayForKey:(NSString *)defaultName {
+    if (!g_acDidBootstrap) return %orig(defaultName);
     if (g_bypassOfficialAccountLimit && [defaultName isEqualToString:@"associatedAccountUserIds"]) return @[];
     return %orig(defaultName);
 }
 - (NSArray *)arrayForKey:(NSString *)defaultName {
+    if (!g_acDidBootstrap) return %orig(defaultName);
     if (g_bypassOfficialAccountLimit && [defaultName isEqualToString:@"associatedAccountUserIds"]) return @[];
     return %orig(defaultName);
 }
 - (id)objectForKey:(NSString *)defaultName {
+    if (!g_acDidBootstrap) return %orig(defaultName);
     if (g_bypassOfficialAccountLimit && [defaultName isEqualToString:@"associatedAccountUserIds"]) return @[];
     return %orig(defaultName);
 }
