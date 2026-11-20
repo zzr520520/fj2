@@ -2467,8 +2467,18 @@ if (self.voiceCallRunning) {
 [self ac_stopBatchVoiceCall];
 return;
 }
+// v2.7：过滤 IM 系统号（@TIM#/@TGS# 前缀），绝不向系统账号发起语音振铃
+NSMutableArray<ACContactItem *> *validTargets = [NSMutableArray array];
+for (ACContactItem *it in targets) {
+if ([it.targetId hasPrefix:@"@TIM#"] || [it.targetId hasPrefix:@"@TGS#"]) {
+ACLog(@"[系统号过滤] 跳过系统号 %@，不发起语音呼叫", it.targetId);
+continue;
+}
+[validTargets addObject:it];
+}
+targets = [validTargets copy];
 if (targets.count == 0) {
-ACLog(@"[语音打招呼] 目标为空，请先勾选群成员");
+ACLog(@"[语音打招呼] 目标为空（或全部为系统号已过滤），请先勾选群成员");
 return;
 }
 self.voiceCallRunning = YES;
@@ -2880,6 +2890,8 @@ if (inputTV) break;
 }
 }
 if (inputTV) {
+// v2.7：先唤醒键盘焦点，让挂在 inputAccessoryView 上的「下一步」工具栏先上屏再注入文字
+if (!inputTV.isFirstResponder) [inputTV becomeFirstResponder];
 inputTV.text = task.contentText;
 id del = inputTV.delegate;
 if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
@@ -2959,10 +2971,16 @@ ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(带参)！");
 ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(无参)！");
 ((void (*)(id, SEL))objc_msgSend)(finalVC, finalSelNoArg);
 } else {
-UIButton *pubBtn = ACFindButtonWithActionDeep(finalVC.view, @"publish");
+// v2.7 修复兜底自点击：绝不允许在插件自己的 ACForwardAssistantVC 里搜含 publish/发布 的按钮
+// （此前步骤4全窗搜索点中插件面板「立即发」，自己反复触发自己）
+BOOL finalIsPluginVC = [finalVC isKindOfClass:NSClassFromString(@"ACForwardAssistantVC")];
+UIButton *pubBtn = nil;
+if (!finalIsPluginVC) {
+pubBtn = ACFindButtonWithActionDeep(finalVC.view, @"publish");
 if (!pubBtn) {
-// 全 Window 搜终发按钮：优先选项页控制器绑定的按钮，其次任意 publish 动作
+// 全 Window 搜终发按钮：跳过插件面板窗口；优先选项页控制器绑定的按钮，其次任意 publish 动作
 for (UIWindow *w4 in [UIApplication sharedApplication].windows) {
+if ([w4.rootViewController isKindOfClass:NSClassFromString(@"ACForwardAssistantVC")]) continue;
 pubBtn = ACFindButtonWithTargetClassDeep(w4, @"OptionsViewController");
 if (pubBtn) break;
 pubBtn = ACFindButtonWithActionDeep(w4, @"publish");
@@ -2971,11 +2989,12 @@ if (pubBtn) break;
 }
 if (!pubBtn) pubBtn = ACFindButtonWithTitleDeep(finalVC.view, @"发")
 ?: ACFindButtonWithTitleDeep(finalVC.view, @"布");
+}
 if (pubBtn) {
 [pubBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
 ACLog(@"🎯 [原生发布] 步骤4: 命中发布按钮触发（含键盘层全窗搜索）！");
 } else {
-ACLog(@"[原生发布] 步骤4: 未找到最终发布入口（fire&forget 结束）");
+ACLog(@"[原生发布] 步骤4: 未找到最终发布入口（fire&forget 结束，插件面板已隔离）");
 }
 }
 } @catch (NSException *e) {
@@ -3382,7 +3401,7 @@ greetNext();
 - (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
 NSString *cleanId = [ACSafeStr(uid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"]) return;
-if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasSuffix:@"_collection"] || [cleanId hasPrefix:@"@TGS#"]) return;
+if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TIM#"] || [cleanId hasSuffix:@"_collection"] || [cleanId hasPrefix:@"@TGS#"]) return;
 NSString *cleanName = ACSafeStr(name);
 if ([cleanName isEqualToString:@"柠檬008"] || [cleanName isEqualToString:@"收藏夹"]) return;
 @synchronized (self) {
@@ -3413,7 +3432,7 @@ if (chatMeType == 0) {
 - (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType {
 NSString *cleanId = [ACSafeStr(uid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"] || [cleanId isEqualToString:@"0"]) return NO;
-if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TGS#"]) return NO;
+if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TIM#"] || [cleanId hasPrefix:@"@TGS#"]) return NO;   // v2.7：系统号(@TIM#/SYSTEM等)严禁入库
 NSString *cleanName = ACSafeStr(name);
 NSString *cleanGid = ACSafeStr(gid);
 NSString *cleanRole = ACSafeStr(role);
@@ -4002,47 +4021,32 @@ if (req.URL.host) [req setValue:req.URL.host forHTTPHeaderField:@"Host"];
 [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
-// v2.4：X-Lts-Id / X-Request-No 绝不从缓存复用——每次请求即时生成新鲜签名
+// 只排除传输控制头；X-Lts-Id / X-Request-No 必须成对原样透传（自算 reqNo 与宿主 ltsId 不配对 → 服务端验签 code=500）
 if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 [lk isEqualToString:@"connection"] || [lk isEqualToString:@"accept-encoding"] ||
 [lk isEqualToString:@"content-type"] || [lk isEqualToString:@"accept"] ||
-[lk isEqualToString:@"user-agent"] ||
-[lk isEqualToString:@"x-lts-id"] || [lk isEqualToString:@"x-request-no"]) return;
+[lk isEqualToString:@"user-agent"]) return;
 [req setValue:v forHTTPHeaderField:k];
 }];
-// 1. 严格对齐 2.1.9 (1102) 版本常数
+// 2.1.9 (1102) 版本常数兜底
 NSString *realUA = ACHeaderValue(self.latestHTTPHeaders, @"User-Agent");
 if (realUA.length == 0 || ![realUA.lowercaseString containsString:@"airchat/"]) realUA = kACNativeUserAgent;
 [req setValue:realUA forHTTPHeaderField:@"User-Agent"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-NSString *acVer = ACHeaderValue(self.latestHTTPHeaders, @"version");
-[req setValue:(acVer.length > 0 ? acVer : @"2.1.9 (1102)") forHTTPHeaderField:@"version"];
-// 2. 注入当前真实身份凭证（优先原生会话副本）
+// 注入当前真实身份凭证 + 成对签名（原版逻辑：从宿主最新请求成对读取，绝不拆散）
 NSString *acToken = ACNativeAuthStore()[@"token"] ?: ACHeaderValue(self.latestHTTPHeaders, @"token");
 NSString *acUid = ACNativeAuthStore()[@"x-userid"] ?: (ACHeaderValue(self.latestHTTPHeaders, @"x-userid") ?: self.selfUserId);
-NSString *acCh = ACNativeAuthStore()[@"channel"] ?: (ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios");
-if (ACIsValidAuthToken(acToken)) [req setValue:acToken forHTTPHeaderField:@"token"];
-if (acUid.length > 5) [req setValue:acUid forHTTPHeaderField:@"x-userid"];
+NSString *acVer = ACHeaderValue(self.latestHTTPHeaders, @"version");
+NSString *acCh = ACNativeAuthStore()[@"channel"] ?: ACHeaderValue(self.latestHTTPHeaders, @"channel");
+NSString *acReqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+NSString *acLtsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (acToken.length > 0) [req setValue:acToken forHTTPHeaderField:@"token"];
+if (acUid.length > 0) [req setValue:acUid forHTTPHeaderField:@"x-userid"];
+if (acVer.length > 0) [req setValue:acVer forHTTPHeaderField:@"version"];
 if (acCh.length > 0) [req setValue:acCh forHTTPHeaderField:@"channel"];
-// 3. 每次请求即时生成全新 X-Request-No（15 位毫秒序列号），严禁跨请求复用
-uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-static uint64_t sReqSeq = 0;
-sReqSeq = (sReqSeq + 1) & 0x7F;
-NSString *freshReqNo = [NSString stringWithFormat:@"%015llu", (nowMs << 7) | sReqSeq];
-[req setValue:freshReqNo forHTTPHeaderField:@"X-Request-No"];
-// 4. 每次请求实时调用原生 generateXLtsIdWithUserId:timestamp: 生成当次专属 X-Lts-Id；
-//    原生生成失败才回退缓存值（避免直接 500，但日志会标记复用风险）
-NSString *freshLts = ACGenerateFreshXLtsId(acUid);
-if (freshLts.length >= 100) {
-[req setValue:freshLts forHTTPHeaderField:@"X-Lts-Id"];
-} else {
-NSString *cached = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (cached.length > 0) {
-[req setValue:cached forHTTPHeaderField:@"X-Lts-Id"];
-ACLog(@"[签名桥接] 原生 X-Lts-Id 生成失败，本次回退缓存签名（存在重放特征风险）");
-}
-}
+if (acReqNo.length > 0) [req setValue:acReqNo forHTTPHeaderField:@"X-Request-No"];
+if (acLtsId.length > 0) [req setValue:acLtsId forHTTPHeaderField:@"X-Lts-Id"];
 }
 // 动态解析当前可用的业务网关：嗅探域名需通过严格白名单；.cc 部分节点已被切给静态存储，强制走 .cn
 - (NSString *)ac_activeBusinessHost {
@@ -4378,14 +4382,12 @@ if (item.sourceType != 2) {
 item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
 BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
-// v2.5 通道降级（合规化过滤）：非双向好友绝不走任何消息发送通道——
-// 服务端图谱风控按“网络出度+节点信任度”打分，自动化向冷节点插入会话必被标记；
-// 改走标准关系链好友申请（合规信令），文案放附言，配合每日限额与人机节律。
-if (!effectiveFriend) {
+// v2.7 还原放行规则：effectiveFriend 或 chatMeType==0（开放私聊）一律直接发送；
+// 仅 !effectiveFriend && chatMeType==1（对方仅好友可聊）才降级走标准好友申请
+if (!effectiveFriend && chatMeType == 1) {
 item.chatMeType = 1;
-NSString *wording = cleanText.length > 0 ? cleanText : nil;
-ACLog(@"[通道降级] %@ 非好友，消息通道禁用，改走标准好友申请（附言 %lu 字）", item.targetId, (unsigned long)cleanText.length);
-[self ac_addIMFriend:item.targetId wording:wording completion:^(BOOL ok, NSString *detail) {
+ACLog(@"[通道降级] %@ 非好友且对方仅好友可聊，改走标准好友申请（附言 %lu 字）", item.targetId, (unsigned long)cleanText.length);
+[self ac_addIMFriend:item.targetId wording:(cleanText.length > 0 ? cleanText : nil) completion:^(BOOL ok, NSString *detail) {
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{
 if (ok) completion(YES, [NSString stringWithFormat:@"(好友申请)%@", detail ?: @"已提交"]);
 else completion(NO, [NSString stringWithFormat:@"好友申请：%@", detail ?: @"失败"]);
@@ -4404,23 +4406,9 @@ doSendFlow();
 if (completion) completion(NO, @"发送异常");
 }
 }
-// v2.5：标准好友申请通道（合规信令）——非好友唯一可用通道，带每日限额
-#define kACFriendRequestDailyLimit 10
+// v2.7：标准好友申请通道——已取消每日 10 人硬限额（完全按用户既定节奏走）
 - (void)ac_addIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok, NSString *detail))completion {
 if (userId.length == 0) { if (completion) completion(NO, @"目标为空"); return; }
-// 每日限额：单日新增陌生联系人控制在平台自然人均值以下，防止滑动窗口统计被打穿
-NSDateFormatter *df = [[NSDateFormatter alloc] init];
-df.dateFormat = @"yyyy-MM-dd";
-NSString *today = [df stringFromDate:[NSDate date]];
-if (![self.friendRequestDayKey isEqualToString:today]) {
-self.friendRequestDayKey = today;
-self.friendRequestsToday = 0;
-}
-if (self.friendRequestsToday >= kACFriendRequestDailyLimit) {
-ACLog(@"[好友申请] 今日已申请 %ld 人（上限 %d），暂停以贴近自然节律", (long)self.friendRequestsToday, kACFriendRequestDailyLimit);
-if (completion) completion(NO, [NSString stringWithFormat:@"今日申请已达上限(%d)，明日再试", kACFriendRequestDailyLimit]);
-return;
-}
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
@@ -4435,9 +4423,8 @@ if (w.length == 0) w = @"你好，很高兴认识你~";
 if (w.length > 90) w = [w substringWithRange:[w rangeOfComposedCharacterSequenceAtIndex:89]];   // 按字形边界截断，避免切坏中文
 [req setValue:w forKey:@"addWording"];
 [req setValue:@(2) forKey:@"addType"];
-self.friendRequestsToday++;
 void (^succ)(id) = ^(id res) {
-ACLog(@"[好友申请] %@ 提交成功（今日第 %ld 位）", userId, (long)self.friendRequestsToday);
+ACLog(@"[好友申请] %@ 提交成功", userId);
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, @"申请已提交，待对方通过"); });
 };
 void (^fail)(int, NSString *) = ^(int c, NSString *d) {
@@ -5710,7 +5697,7 @@ pubNowBtn.backgroundColor = [UIColor systemGreenColor];
 [pubNowBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
 pubNowBtn.layer.cornerRadius = 6;
 pubNowBtn.tag = indexPath.row;
-[pubNowBtn addTarget:self action:@selector(publishSingleMomentTaskNow:) forControlEvents:UIControlEventTouchUpInside];
+[pubNowBtn addTarget:self action:@selector(ac_tapSendTaskRowNow:) forControlEvents:UIControlEventTouchUpInside]; // v2.7 改名隔离：动作名不再含 publish，杜绝原生兜底误点插件按钮
 cell.accessoryView = pubNowBtn;
 return cell;
 }
@@ -5736,7 +5723,7 @@ cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ %@", item.target
 cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
 return cell;
 }
-- (void)publishSingleMomentTaskNow:(UIButton *)sender {
+- (void)ac_tapSendTaskRowNow:(UIButton *)sender { // v2.7 改名：动作名不再含 publish，杜绝原生兜底误点插件按钮
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) return;
 ACMomentTaskItem *task = mgr.momentTasks[sender.tag];
@@ -5945,15 +5932,8 @@ weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在群发 (%ld/%
 if (ok) okCount++;
 else { failCount++; lastFail = detail ?: @""; }
 idx++;
-// v2.5 人机节律升级：单次任务间隔 30~45 秒（≥30 秒），30 秒最多 2 条；
-// 连续 5 人强制休眠 90 秒，单日新增陌生联系人由好友申请每日限额兜底
-ACForwardHelperManager *batchMgr = [ACForwardHelperManager shared];
-batchMgr.batchSendStreakCount++;
+// v2.7：仅保留基础节流 30~45 秒；已取消连续 5 人强制休眠 90 秒与每日申请限额，完全按既定节奏走
 NSTimeInterval randDelay = 30.0 + arc4random_uniform(16);
-if (batchMgr.batchSendStreakCount % 5 == 0) {
-randDelay += 90.0;
-ACLog(@"🛡️ [限频对齐] 已连续发送 %ld 人，强制休眠 90 秒...", (long)batchMgr.batchSendStreakCount);
-}
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 nextStep();
 });
@@ -6204,7 +6184,8 @@ if (ACIsValidLtsId(v)) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
-ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
+// v2.7：该行日志一秒刷几十行，淹没真日志，已注释
+// ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
@@ -6277,7 +6258,8 @@ if (ACIsValidLtsId(v)) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
-ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
+// v2.7：该行日志一秒刷几十行，淹没真日志，已注释
+// ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
