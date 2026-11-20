@@ -808,6 +808,9 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_prewarmAndScrollMomentsForAutoLike;
 // —— 打招呼防封降权（拟人化批次冷却 + 破盾限频） ——
 @property (nonatomic, assign) NSInteger batchSendStreakCount;
+// v2.8：群发速度可配置（⚙️工具 → ⏱️群发发送间隔设置）
+@property (nonatomic, assign) float batchSendIntervalSeconds; // 群发单条间隔秒数（默认 3.0，最低 0.2）
+@property (nonatomic, assign) float batchCooldownSeconds;     // 连续发送后的额外冷却秒数（0 表示关闭长休眠）
 @property (nonatomic, assign) NSInteger unlockAttemptCountInSession;
 @property (nonatomic, assign) NSTimeInterval lastUnlockAttemptAt;
 @end
@@ -1264,6 +1267,9 @@ for (ACAutoReplyRule *r in self.autoReplyRules) {
 [ud setObject:(self.robotDisplayName ?: @"群管机器人") forKey:[self ac_udKey:@"Robot_Name"]];
 [ud setFloat:self.voiceHangupSeconds forKey:[self ac_udKey:@"VoiceHangup_Seconds"]];
 [ud setObject:(self.manualTargetGroupId ?: @"") forKey:[self ac_udKey:@"ManualTargetGroupId"]];
+// v2.8：群发速度设置持久化（按账号分区键）
+[ud setFloat:self.batchSendIntervalSeconds forKey:[self ac_udKey:@"BatchSend_IntervalSec"]];
+[ud setFloat:self.batchCooldownSeconds forKey:[self ac_udKey:@"BatchCooldown_Sec"]];
 NSArray *seenArr = [[self.autoCommentSeenIds allObjects] sortedArrayUsingSelector:@selector(compare:)];
 if (seenArr.count > 1500) seenArr = [seenArr subarrayWithRange:NSMakeRange(seenArr.count - 1500, 1500)];
 [ud setObject:seenArr forKey:[self ac_udKey:@"AutoComment_Seen"]];
@@ -1308,6 +1314,15 @@ self.robotDisplayName = savedRobotName.length > 0 ? savedRobotName : @"群管机
 float savedHangup = [ud floatForKey:[self ac_udKey:@"VoiceHangup_Seconds"]];
 self.voiceHangupSeconds = (savedHangup >= 0.3f && savedHangup <= 15.0f) ? savedHangup : 1.0f;
 self.manualTargetGroupId = ACSafeStr([ud objectForKey:[self ac_udKey:@"ManualTargetGroupId"]]);
+// v2.8：群发速度设置读取（objectForKey 判断存在性，允许冷却设为 0）
+{
+id savedBatchInt = [ud objectForKey:[self ac_udKey:@"BatchSend_IntervalSec"]];
+float bInt = savedBatchInt ? [savedBatchInt floatValue] : 3.0f;
+self.batchSendIntervalSeconds = (bInt >= 0.2f && bInt <= 300.0f) ? bInt : 3.0f;
+id savedBatchCool = [ud objectForKey:[self ac_udKey:@"BatchCooldown_Sec"]];
+float bCool = savedBatchCool ? [savedBatchCool floatValue] : 0.0f;
+self.batchCooldownSeconds = (bCool >= 0.0f && bCool <= 600.0f) ? bCool : 0.0f;
+}
 NSArray *savedSeen = ACSafeArray([ud objectForKey:[self ac_udKey:@"AutoComment_Seen"]]);
 if (savedSeen.count > 0) {
 for (id v in savedSeen) { NSString *sid = ACSafeStr(v); if (sid.length > 3) [self.autoCommentSeenIds addObject:sid]; }
@@ -2441,13 +2456,14 @@ ACContactItem *t = queue.firstObject;
 [queue removeObjectAtIndex:0];
 [sself sendText:@"" mediaSlot:ACMediaSlotBatchSend attachMedia:YES toItem:t completion:^(BOOL ok, NSString *detail) {
 ACLog(@"[语音条打招呼] %@ [%@] %@", ok ? @"✅" : @"❌", t.name ?: t.targetId, detail ?: @"");
-// 防封雷区④：拟人化阶梯延时 + 每 8 人强制冷却，打断服务端滑动窗口频控计数
+// 防封雷区④：间隔与冷却全部可配置（⚙️工具 → ⏱️群发发送间隔设置，默认 3 秒 + 每 8 人冷却）
 if (sself) {
 sself.batchSendStreakCount++;
-NSTimeInterval delay = 6.5 + (arc4random_uniform(55) / 10.0); // 拟人化间隔 6.5~12 秒
-if (sself.batchSendStreakCount % 8 == 0) {
-delay += 28.0 + arc4random_uniform(15);
-ACLog(@"🛡️ [防封降权] 已连续发送 %ld 人，自动进入 %.0f 秒安全冷却休息...", (long)sself.batchSendStreakCount, delay);
+float baseSec = (sself.batchSendIntervalSeconds >= 0.2f) ? sself.batchSendIntervalSeconds : 3.0f;
+NSTimeInterval delay = baseSec + (arc4random_uniform(6) / 10.0); // 0~0.5 秒微小浮动拟人化
+if (sself.batchCooldownSeconds > 0.0f && sself.batchSendStreakCount % 8 == 0) {
+delay += sself.batchCooldownSeconds;
+ACLog(@"⏳ [发送冷却] 已连续发送 %ld 人，按设置休眠 %.1f 秒...", (long)sself.batchSendStreakCount, delay);
 }
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), nextSend);
 }
@@ -2557,8 +2573,9 @@ if ([engine respondsToSelector:hangupEngineSel]) {
 ACLog(@"[语音打招呼] 挂断异常 %@", e.reason);
 }
 ACLog(@"[语音打招呼] 已自动挂断 %@", uid);
-// 间隔 3.5-6 秒再拨下一位，避免信令风暴
-NSTimeInterval gap = 3.5 + (arc4random_uniform(26) / 10.0);
+// 间隔可配置：读取群发间隔设置（默认 3.5~6 秒），避免信令风暴
+float baseGap = (m2.batchSendIntervalSeconds >= 0.2f) ? m2.batchSendIntervalSeconds : 3.5f;
+NSTimeInterval gap = baseGap + (arc4random_uniform(26) / 10.0);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 if (nextCall) nextCall();
 });
@@ -5607,7 +5624,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
-if (idx == 6) return 7; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数
+if (idx == 6) return 8; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数 / 语音条 / 群发间隔设置(v2.8)
 return [self currentItems].count;
 }
 - (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
@@ -5654,7 +5671,7 @@ cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 cell.textLabel.text = @"⏱️ 语音自动挂断秒数";
 cell.detailTextLabel.text = [NSString stringWithFormat:@"当前 %.1f 秒（允许 0.3–15 秒，越短越安全）", mgr.voiceHangupSeconds];
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-} else { // row 6 批量语音条打招呼
+} else if (indexPath.row == 6) { // row 6 批量语音条打招呼
 NSInteger selCount = 0;
 for (ACContactItem *m in mgr.groupMemberList) if (m.isSelected) selCount++;
 NSInteger targetCount = selCount > 0 ? selCount : (NSInteger)mgr.groupMemberList.count;
@@ -5664,6 +5681,14 @@ cell.textLabel.textColor = mgr.voiceMemoRunning ? [UIColor systemRedColor] : [UI
 cell.detailTextLabel.text = hasAudio
 ? [NSString stringWithFormat:@"向 %ld 位群成员私聊发送语音条（%d 秒），走普通消息信令，不触发 VoIP 骚扰风控", (long)targetCount, [mgr audioDurationForSlot:ACMediaSlotBatchSend]]
 : @"⚠️ 请先在【💬回复】面板媒体框录制/导入语音条（槽位0 群发专属）";
+cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+} else { // v2.8 row 7 群发发送间隔设置
+cell.textLabel.text = @"⏱️ 群发发送间隔设置";
+NSString *coolDesc = (mgr.batchCooldownSeconds > 0.0f)
+? [NSString stringWithFormat:@"每8人额外休眠%.0f秒", mgr.batchCooldownSeconds]
+: @"不额外休眠";
+cell.detailTextLabel.text = [NSString stringWithFormat:@"单条间隔: %.1f 秒 | %@（点击修改）",
+mgr.batchSendIntervalSeconds, coolDesc];
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 }
 return cell;
@@ -5768,6 +5793,42 @@ self.statusLabel.text = mgr.voiceCallRunning
 ? [NSString stringWithFormat:@"📞 批量语音打招呼运行中（%lu 人，%.1f 秒自动挂断）", (unsigned long)targets.count, mgr.voiceHangupSeconds]
 : @"🛑 已停止批量语音打招呼";
 [tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:1 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
+return;
+}
+if (indexPath.row == 7) { // v2.8 群发发送间隔设置
+UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⏱️ 自定义群发速度"
+message:@"第1格：每条消息间隔秒数（最低 0.2 秒）\n第2格：每连续8人额外休息秒数（填 0 则不休息）"
+preferredStyle:UIAlertControllerStyleAlert];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.placeholder = @"单条间隔秒数，如 2.0";
+tf.text = [NSString stringWithFormat:@"%.1f", mgr.batchSendIntervalSeconds];
+tf.keyboardType = UIKeyboardTypeDecimalPad;
+}];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.placeholder = @"额外冷却秒数，填 0 关闭休眠";
+tf.text = [NSString stringWithFormat:@"%.0f", mgr.batchCooldownSeconds];
+tf.keyboardType = UIKeyboardTypeDecimalPad;
+}];
+[alert addAction:[UIAlertAction actionWithTitle:@"保存生效" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+NSString *s1 = [alert.textFields[0].text stringByReplacingOccurrencesOfString:@"," withString:@"."];
+NSString *s2 = [alert.textFields[1].text stringByReplacingOccurrencesOfString:@"," withString:@"."];
+float intervalSec = [s1 floatValue];
+float cooldownSec = [s2 floatValue];
+if (intervalSec < 0.2f || intervalSec > 300.0f) {
+self.statusLabel.textColor = [UIColor systemRedColor];
+self.statusLabel.text = @"❌ 单条间隔需在 0.2 ~ 300 秒之间";
+return;
+}
+if (cooldownSec < 0.0f || cooldownSec > 600.0f) cooldownSec = 0.0f;
+mgr.batchSendIntervalSeconds = intervalSec;
+mgr.batchCooldownSeconds = cooldownSec;
+[mgr saveAllCustomSettings];
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = [NSString stringWithFormat:@"✅ 已保存：每 %.1f 秒发 1 人（冷却 %.0f 秒）", intervalSec, cooldownSec];
+[tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:7 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
+}]];
+[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[self presentViewController:alert animated:YES completion:nil];
 return;
 }
 if (indexPath.row == 6) {
@@ -5932,8 +5993,15 @@ weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在群发 (%ld/%
 if (ok) okCount++;
 else { failCount++; lastFail = detail ?: @""; }
 idx++;
-// v2.7：仅保留基础节流 30~45 秒；已取消连续 5 人强制休眠 90 秒与每日申请限额，完全按既定节奏走
-NSTimeInterval randDelay = 30.0 + arc4random_uniform(16);
+// v2.8：间隔与冷却全部可配置（⚙️工具 → ⏱️群发发送间隔设置；冷却填 0 完全不休眠）
+ACForwardHelperManager *batchMgr = [ACForwardHelperManager shared];
+batchMgr.batchSendStreakCount++;
+float baseSec = (batchMgr.batchSendIntervalSeconds >= 0.2f) ? batchMgr.batchSendIntervalSeconds : 3.0f;
+NSTimeInterval randDelay = baseSec + (arc4random_uniform(6) / 10.0); // 加 0~0.5 秒微小浮动拟人化
+if (batchMgr.batchCooldownSeconds > 0.0f && batchMgr.batchSendStreakCount % 8 == 0) {
+randDelay += batchMgr.batchCooldownSeconds;
+ACLog(@"⏳ [发送冷却] 已连续发送 %ld 人，按设置休眠 %.1f 秒...", (long)batchMgr.batchSendStreakCount, randDelay);
+}
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 nextStep();
 });
